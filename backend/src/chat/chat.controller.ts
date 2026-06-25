@@ -1,7 +1,6 @@
 import {
   Controller,
   Post,
-  Get,
   Query,
   Body,
   UsePipes,
@@ -12,7 +11,7 @@ import {
 import { Observable } from 'rxjs';
 import { ChatService } from './chat.service';
 import { ChatMessageDto } from './dto/chat-message.dto';
-import { contentToString } from './chat-history.service';
+import { ChatStreamEvent } from './chat-stream.types';
 
 @Controller('chat')
 export class ChatController {
@@ -21,8 +20,8 @@ export class ChatController {
   @Post()
   @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
   async chat(@Body() dto: ChatMessageDto) {
-    const content = await this.chatService.chat(dto);
-    return { sessionId: dto.sessionId, content };
+    const events = await this.chatService.chat(dto);
+    return { sessionId: dto.sessionId, events };
   }
 
   @Sse('stream')
@@ -32,16 +31,17 @@ export class ChatController {
       let cancelled = false;
       (async () => {
         try {
-          const iter = await this.chatService.stream(dto);
-          for await (const chunk of iter) {
+          const iter = this.chatService.stream(dto);
+          for await (const ev of iter) {
             if (cancelled) break;
-            const text = contentToString(chunk.content);
-            if (text) {
-              subscriber.next({ data: { content: text } });
+            subscriber.next(toMessageEvent(ev));
+            if (ev.type === 'done') {
+              subscriber.complete();
+              return;
             }
           }
           if (!cancelled) {
-            subscriber.next({ data: { done: true } });
+            subscriber.next({ data: { type: 'done' } });
             subscriber.complete();
           }
         } catch (err) {
@@ -53,4 +53,8 @@ export class ChatController {
       };
     });
   }
+}
+
+function toMessageEvent(ev: ChatStreamEvent): MessageEvent {
+  return { data: ev };
 }

@@ -87,6 +87,28 @@
   border: 1px solid #e5e7eb;
 }
 
+.bubble.chart {
+  max-width: 95%;
+  width: 100%;
+}
+
+.chart-wrap {
+  width: 100%;
+  background: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 8px;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.tool-status-content {
+  background: #fef3c7 !important;
+  border-color: #f59e0b !important;
+  color: #92400e !important;
+  font-style: italic;
+}
+
 .input-bar {
   display: flex;
   gap: 8px;

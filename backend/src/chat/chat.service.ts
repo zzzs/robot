@@ -1,38 +1,21 @@
-import { Inject, Injectable } from '@nestjs/common';
-import type { AIMessageChunk } from '@langchain/core/messages';
-import { CHAT_CHAIN } from './chat.constants';
+import { Injectable } from '@nestjs/common';
+import { ChatOrchestrator } from './chat.orchestrator';
 import { ChatMessageDto } from './dto/chat-message.dto';
-import { contentToString } from './chat-history.service';
-
-export interface ChatChain {
-  invoke(
-    input: Record<string, unknown>,
-    config: { configurable: { sessionId: string } },
-  ): Promise<AIMessageChunk>;
-  stream(
-    input: Record<string, unknown>,
-    config: { configurable: { sessionId: string } },
-  ): Promise<AsyncIterable<AIMessageChunk>>;
-}
+import { ChatStreamEvent } from './chat-stream.types';
 
 @Injectable()
 export class ChatService {
-  constructor(@Inject(CHAT_CHAIN) private readonly chain: ChatChain) {}
+  constructor(private readonly orchestrator: ChatOrchestrator) {}
 
-  async chat(dto: ChatMessageDto): Promise<string> {
-    const res = await this.chain.invoke(
-      { ability: 'general Q&A', question: dto.message },
-      { configurable: { sessionId: dto.sessionId } },
-    );
-    return contentToString(res.content);
+  async chat(dto: ChatMessageDto): Promise<ChatStreamEvent[]> {
+    const events: ChatStreamEvent[] = [];
+    for await (const ev of this.orchestrator.stream(dto)) {
+      events.push(ev);
+    }
+    return events;
   }
 
-  async stream(
-    dto: ChatMessageDto,
-  ): Promise<AsyncIterable<AIMessageChunk>> {
-    return this.chain.stream(
-      { ability: 'general Q&A', question: dto.message },
-      { configurable: { sessionId: dto.sessionId } },
-    );
+  stream(dto: ChatMessageDto): AsyncGenerator<ChatStreamEvent> {
+    return this.orchestrator.stream(dto);
   }
 }

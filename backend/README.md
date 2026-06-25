@@ -25,6 +25,27 @@
 
 [Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
 
+This backend also hosts a **股票分析 (stock-analysis)** capability exposed to the chat agent as a `analyze_stock` tool. Market data is fetched via `@pidanmoe/mcp-stock` (a long-lived child process speaking MCP over stdio, backed by Tushare). Technical indicators (MA / MACD / RSI / BOLL / KDJ) are computed server-side; the chat SSE stream emits typed events (`text | chart | tool-status | done`) so the frontend can render candlestick charts alongside the assistant's summary.
+
+### Required environment variables
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `TUSHARE_TOKEN` | Tushare API token (https://tushare.pro). When missing, stock analysis is disabled and the agent replies `"No data available for analysis"`. | — |
+| `MCP_STOCK_COMMAND` | Command used to launch the MCP subprocess. | `npx` |
+| `MCP_STOCK_ARGS` | Comma-separated args for the subprocess. | `-y,@pidanmoe/mcp-stock` |
+| `STOCK_MIN_BARS` | Minimum daily bars required for a full analysis. | `60` |
+| `STOCK_MAX_RETRIES` | Number of attempts before treating a tool call as `no-data`. | `2` |
+| `STOCK_RETRY_BACKOFF_MS` | Delay between retries. | `500` |
+
+Copy `backend/.env.example` to `backend/.env` and fill in `TUSHARE_TOKEN`.
+
+### Operational notes
+
+- On boot the backend spawns `npx -y @pidanmoe/mcp-stock` as a child process. The first call after boot incurs ~1–2 s `npx` cold-start latency; subsequent calls reuse the long-lived process.
+- If the child crashes it is automatically restarted on the next call.
+- Integrity rules are non-negotiable: empty or insufficient data MUST trip `"No data available for analysis"` / `"Data insufficient for reliable analysis"` exactly. These strings are enforced in both the tool description and the chat system prompt.
+
 ## Project setup
 
 ```bash
