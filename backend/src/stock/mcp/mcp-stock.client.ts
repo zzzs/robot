@@ -8,6 +8,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { traceable } from 'langsmith/traceable';
 import { Bar, FetchResult, RealtimeQuote } from '../stock.types';
 import { parseKLineText, parseRealtimeText } from './daily-parser';
 
@@ -164,35 +165,47 @@ export class McpStockClient implements OnModuleInit, OnModuleDestroy {
     return { start: fmt(start), end: fmt(end) };
   }
 
-  async getDaily(tsCode: string, days = 90): Promise<FetchResult<Bar[]>> {
-    const { start, end } = this.dateRangeNDays(days);
-    return this.callKLine('daily', tsCode, start, end);
-  }
+  getDaily = traceable(
+    async (tsCode: string, days = 90): Promise<FetchResult<Bar[]>> => {
+      const { start, end } = this.dateRangeNDays(days);
+      return this.callKLine('daily', tsCode, start, end);
+    },
+    { name: 'mcp.getDaily', run_type: 'tool' },
+  );
 
-  async getWeekly(tsCode: string, weeks = 52): Promise<FetchResult<Bar[]>> {
-    const { start, end } = this.dateRangeNDays(weeks * 7);
-    return this.callKLine('weekly', tsCode, start, end);
-  }
+  getWeekly = traceable(
+    async (tsCode: string, weeks = 52): Promise<FetchResult<Bar[]>> => {
+      const { start, end } = this.dateRangeNDays(weeks * 7);
+      return this.callKLine('weekly', tsCode, start, end);
+    },
+    { name: 'mcp.getWeekly', run_type: 'tool' },
+  );
 
-  async getMonthly(tsCode: string, months = 36): Promise<FetchResult<Bar[]>> {
-    const { start, end } = this.dateRangeNDays(months * 30);
-    return this.callKLine('monthly', tsCode, start, end);
-  }
+  getMonthly = traceable(
+    async (tsCode: string, months = 36): Promise<FetchResult<Bar[]>> => {
+      const { start, end } = this.dateRangeNDays(months * 30);
+      return this.callKLine('monthly', tsCode, start, end);
+    },
+    { name: 'mcp.getMonthly', run_type: 'tool' },
+  );
 
-  async getRealtime(tsCode: string): Promise<FetchResult<RealtimeQuote>> {
-    if (!(await this.ensureStarted())) {
-      return { status: 'error', message: 'MCP client not started' };
-    }
-    try {
-      const text = await this.callWithRetry({
-        name: 'rt_k',
-        args: { ts_code: tsCode },
-      });
-      return parseRealtimeText(text);
-    } catch (err) {
-      return { status: 'error', message: (err as Error).message };
-    }
-  }
+  getRealtime = traceable(
+    async (tsCode: string): Promise<FetchResult<RealtimeQuote>> => {
+      if (!(await this.ensureStarted())) {
+        return { status: 'error', message: 'MCP client not started' };
+      }
+      try {
+        const text = await this.callWithRetry({
+          name: 'rt_k',
+          args: { ts_code: tsCode },
+        });
+        return parseRealtimeText(text);
+      } catch (err) {
+        return { status: 'error', message: (err as Error).message };
+      }
+    },
+    { name: 'mcp.getRealtime', run_type: 'tool' },
+  );
 
   async health(): Promise<boolean> {
     if (!(await this.ensureStarted()) || !this.client) return false;

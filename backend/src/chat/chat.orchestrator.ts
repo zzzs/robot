@@ -100,7 +100,18 @@ export class ChatOrchestrator {
 
       let stream: AsyncIterable<AIMessageChunk>;
       try {
-        stream = await this.streamWithRetry(bound, messages);
+        stream = await this.streamWithRetry(bound, messages, {
+          runName:
+            iter === 0
+              ? `stock-agent · ${dto.message.slice(0, 40)}`
+              : `stock-agent · summary (iter ${iter})`,
+          tags: ['stock-agent', `iter-${iter}`],
+          metadata: {
+            sessionId: dto.sessionId,
+            iter: String(iter),
+            userMessage: dto.message.slice(0, 200),
+          },
+        });
       } catch (err) {
         const msg = (err as Error).message;
         if (msg.includes('429') || /rate/i.test(msg)) {
@@ -279,18 +290,20 @@ export class ChatOrchestrator {
   /**
    * Run bound.stream() with exponential backoff on 429 / rate-limit errors.
    * The LLM gateway throttles bursty traffic; a single retry after a short
-   * sleep usually clears it.
+   * sleep usually clears it. Forwards RunnableConfig (metadata/tags/runName)
+   * so the call shows up nicely in LangSmith.
    */
   private async streamWithRetry(
     bound: ReturnType<ChatAnthropic['bindTools']>,
     messages: BaseMessage[],
+    config?: Record<string, unknown>,
     maxAttempts = 3,
   ): Promise<AsyncIterable<AIMessageChunk>> {
     const backoffMs = 800;
     let lastErr: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        return await bound.stream(messages, {});
+        return await bound.stream(messages, config ?? {});
       } catch (err) {
         lastErr = err;
         const msg = (err as Error).message ?? '';

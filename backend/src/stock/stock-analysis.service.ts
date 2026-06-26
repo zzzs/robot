@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { traceable } from 'langsmith/traceable';
 import { IndicatorService } from './indicators/indicator.service';
 import { SignalDeriver } from './analysis/signal.deriver';
 import { TrendScorer } from './analysis/trend.scorer';
@@ -46,7 +47,22 @@ export class StockAnalysisService {
     this.logger = new Logger(loggerTag);
   }
 
-  async analyze(input: AnalyzeStockInput): Promise<AnalysisResult> {
+  /**
+   * Traced wrapper so each analyze() call shows up as a single "tool" run in
+   * LangSmith — exposing the input ts_code/range, output status, bar count,
+   * trend direction, latency, and any errors. The actual implementation is
+   * kept private (`analyzeImpl`) so the trace boundary is explicit.
+   */
+  analyze = traceable(
+    (input: AnalyzeStockInput): Promise<AnalysisResult> =>
+      this.analyzeImpl(input),
+    {
+      name: 'stock-analysis.analyze',
+      run_type: 'tool',
+    },
+  );
+
+  private async analyzeImpl(input: AnalyzeStockInput): Promise<AnalysisResult> {
     const range = input.range ?? 'medium';
     const symbol = input.ts_code?.trim().toUpperCase();
     if (!symbol) {

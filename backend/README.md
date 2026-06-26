@@ -46,6 +46,42 @@ Copy `backend/.env.example` to `backend/.env` and fill in `TUSHARE_TOKEN`.
 - If the child crashes it is automatically restarted on the next call.
 - Integrity rules are non-negotiable: empty or insufficient data MUST trip `"No data available for analysis"` / `"Data insufficient for reliable analysis"` exactly. These strings are enforced in both the tool description and the chat system prompt.
 
+### Tracing with LangSmith (optional but strongly recommended)
+
+Every chat request, model call, and tool execution is auto-traced when `LANGCHAIN_TRACING_V2=true` and `LANGCHAIN_API_KEY` are set. No code changes needed — LangChain Core reads these env vars on startup.
+
+**Setup (5 minutes):**
+
+1. Register at https://smith.langchain.com (free tier: 5k traces/month).
+2. Settings → API Keys → Create API Key.
+3. Add to `backend/.env`:
+   ```
+   LANGCHAIN_TRACING_V2=true
+   LANGCHAIN_API_KEY=lsv2_pt_xxxxxxxxxxxx
+   LANGCHAIN_PROJECT=robot           # any name; traces group under this project
+   ```
+4. Restart the backend, send any chat message.
+5. Open the LangSmith UI → "robot" project → see the full trace tree.
+
+**What you'll see in each trace:**
+
+| Node | What it shows |
+|---|---|
+| `stock-agent · <message>` | Top-level run: full message, sessionId, iter count |
+| `ChatAnthropic` (child) | The actual model call: full prompt, response, token usage, latency |
+| `stock-analysis.analyze` | Each analyze call: input ts_code/range, output status, bar count, trend direction |
+| `sina.getDaily` / `sina.getRealtime` | Each HTTP call to Sina: input, parsed bar count, latency |
+| `mcp.getDaily` etc. | Each MCP tool call (when Tushare token is configured) |
+
+Common debugging scenarios:
+
+- **"Why didn't the chart show up?"** — Open the trace, find the `stock-analysis.analyze` node, check `outputs.status`. If `no-data`, drill into the child `sina.getDaily` to see why.
+- **"Why did the model call the wrong tool?"** — Look at the `ChatAnthropic` run, see the full prompt and tool definitions the model actually saw.
+- **"Where's the latency going?"** — Each node shows wall-clock time; expand the trace tree to find the slow one.
+- **"How much does each request cost?"** — Token usage is summed at the model node.
+
+When `LANGCHAIN_API_KEY` is empty (the default), tracing is fully disabled — zero network calls, zero perf overhead.
+
 ## Project setup
 
 ```bash

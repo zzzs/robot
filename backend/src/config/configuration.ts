@@ -18,4 +18,14 @@ export default () => ({
       10,
     ),
   },
+  // LangSmith tracing is enabled automatically when LANGCHAIN_TRACING_V2=true
+  // AND LANGCHAIN_API_KEY is non-empty. Otherwise it no-ops (no network calls,
+  // no perf overhead). Get a key at https://smith.langchain.com.
+  langsmith: {
+    tracingV2: process.env.LANGCHAIN_TRACING_V2 === 'true',
+    apiKey: process.env.LANGCHAIN_API_KEY,
+    endpoint:
+      process.env.LANGCHAIN_ENDPOINT ?? 'https://api.smith.langchain.com',
+    project: process.env.LANGCHAIN_PROJECT ?? 'robot',
+  },
 });

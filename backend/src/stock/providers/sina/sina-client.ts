@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { traceable } from 'langsmith/traceable';
 import {
   Bar,
   FetchResult,
@@ -22,86 +23,93 @@ const SINA_HEADERS: HeadersInit = {
  * Free, no-token A-share market-data source backed by Sina Finance HTTP APIs.
  * Structurally compatible with StockDataSource so it can be swapped in for
  * McpStockClient.
+ *
+ * Both public methods are wrapped in `traceable` so they show up as tool runs
+ * in LangSmith traces — giving you per-call latency, input args, parsed bar
+ * count, and any errors, all in the trace tree.
  */
 @Injectable()
 export class SinaClient implements StockDataSource {
   private readonly logger = new Logger(SinaClient.name);
 
-  async getDaily(tsCode: string, days = 90): Promise<FetchResult<Bar[]>> {
-    const symbol = toSinaSymbol(tsCode);
-    if (!symbol) {
-      return { status: 'error', message: `invalid ts_code: ${tsCode}` };
-    }
-    // Sina caps datalen at 1023.
-    const datalen = Math.min(Math.max(days, 30), 1023);
-    const url = `${KLINE_URL}?symbol=${symbol}&scale=240&ma=no&datalen=${datalen}`;
-    this.logger.log(`GET ${url}`);
-    try {
-      const res = await fetch(url, { headers: SINA_HEADERS });
-      this.logger.log(`sina responded HTTP ${res.status} ${res.statusText}`);
-      if (!res.ok) {
-        const body = await res.text().catch(() => '<no body>');
-        this.logger.warn(
-          `sina non-OK body (first 200 chars): ${body.slice(0, 200)}`,
-        );
-        return {
-          status: 'error',
-          message: `sina HTTP ${res.status} ${res.statusText}`,
-        };
+  getDaily = traceable(
+    async (tsCode: string, days = 90): Promise<FetchResult<Bar[]>> => {
+      const symbol = toSinaSymbol(tsCode);
+      if (!symbol) {
+        return { status: 'error', message: `invalid ts_code: ${tsCode}` };
       }
-      const text = await res.text();
-      this.logger.log(
-        `sina body length=${text.length} first120=${text.slice(0, 120)}`,
-      );
-      const parsed = parseSinaKLine(text, tsCode);
-      if (parsed.status === 'ok') {
+      const datalen = Math.min(Math.max(days, 30), 1023);
+      const url = `${KLINE_URL}?symbol=${symbol}&scale=240&ma=no&datalen=${datalen}`;
+      this.logger.log(`GET ${url}`);
+      try {
+        const res = await fetch(url, { headers: SINA_HEADERS });
+        this.logger.log(`sina responded HTTP ${res.status} ${res.statusText}`);
+        if (!res.ok) {
+          const body = await res.text().catch(() => '<no body>');
+          this.logger.warn(
+            `sina non-OK body (first 200 chars): ${body.slice(0, 200)}`,
+          );
+          return {
+            status: 'error',
+            message: `sina HTTP ${res.status} ${res.statusText}`,
+          };
+        }
+        const text = await res.text();
         this.logger.log(
-          `sina parsed OK bars=${parsed.data?.length ?? 0} for ${tsCode}`,
+          `sina body length=${text.length} first120=${text.slice(0, 120)}`,
         );
-      } else {
-        this.logger.warn(
-          `getDaily ${tsCode} ${parsed.status}: ${parsed.message}`,
-        );
+        const parsed = parseSinaKLine(text, tsCode);
+        if (parsed.status === 'ok') {
+          this.logger.log(
+            `sina parsed OK bars=${parsed.data?.length ?? 0} for ${tsCode}`,
+          );
+        } else {
+          this.logger.warn(
+            `getDaily ${tsCode} ${parsed.status}: ${parsed.message}`,
+          );
+        }
+        return parsed;
+      } catch (err) {
+        const msg = (err as Error).message;
+        this.logger.error(`getDaily ${tsCode} threw: ${msg}`);
+        return { status: 'error', message: msg };
       }
-      return parsed;
-    } catch (err) {
-      const msg = (err as Error).message;
-      this.logger.error(`getDaily ${tsCode} threw: ${msg}`);
-      return { status: 'error', message: msg };
-    }
-  }
+    },
+    { name: 'sina.getDaily', run_type: 'tool' },
+  );
 
-  async getRealtime(tsCode: string): Promise<FetchResult<RealtimeQuote>> {
-    const symbol = toSinaSymbol(tsCode);
-    if (!symbol) {
-      return { status: 'error', message: `invalid ts_code: ${tsCode}` };
-    }
-    const url = `${REALTIME_URL}${symbol}`;
-    try {
-      const res = await fetch(url, { headers: SINA_HEADERS });
-      if (!res.ok) {
-        return {
-          status: 'error',
-          message: `sina HTTP ${res.status} ${res.statusText}`,
-        };
+  getRealtime = traceable(
+    async (tsCode: string): Promise<FetchResult<RealtimeQuote>> => {
+      const symbol = toSinaSymbol(tsCode);
+      if (!symbol) {
+        return { status: 'error', message: `invalid ts_code: ${tsCode}` };
       }
-      // Sina returns GB18030-encoded text for the name field; Node fetch
-      // decodes as UTF-8 by default. Decode manually if needed.
-      const buf = await res.arrayBuffer();
-      const text = decodeSina(buf);
-      const parsed = parseSinaRealtime(text, tsCode);
-      if (parsed.status === 'error' || parsed.status === 'empty') {
-        this.logger.warn(
-          `getRealtime ${tsCode} ${parsed.status}: ${parsed.message}`,
-        );
+      const url = `${REALTIME_URL}${symbol}`;
+      try {
+        const res = await fetch(url, { headers: SINA_HEADERS });
+        if (!res.ok) {
+          return {
+            status: 'error',
+            message: `sina HTTP ${res.status} ${res.statusText}`,
+          };
+        }
+        const buf = await res.arrayBuffer();
+        const text = decodeSina(buf);
+        const parsed = parseSinaRealtime(text, tsCode);
+        if (parsed.status === 'error' || parsed.status === 'empty') {
+          this.logger.warn(
+            `getRealtime ${tsCode} ${parsed.status}: ${parsed.message}`,
+          );
+        }
+        return parsed;
+      } catch (err) {
+        const msg = (err as Error).message;
+        this.logger.error(`getRealtime ${tsCode} threw: ${msg}`);
+        return { status: 'error', message: msg };
       }
-      return parsed;
-    } catch (err) {
-      const msg = (err as Error).message;
-      this.logger.error(`getRealtime ${tsCode} threw: ${msg}`);
-      return { status: 'error', message: msg };
-    }
-  }
+    },
+    { name: 'sina.getRealtime', run_type: 'tool' },
+  );
 }
 
 /**
