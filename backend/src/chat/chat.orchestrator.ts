@@ -22,6 +22,7 @@ import {
 import { StockAnalysisService } from '../stock/stock-analysis.service';
 import { AnalysisResult } from '../stock/stock.types';
 import { normalizeTsCode } from '../stock/normalize-ts-code';
+import { ChatOrchestratorInterface } from './chat.service';
 
 const SYSTEM_PROMPT = [
   '你是一个乐于助人的中文助理,擅长一般问答,并对中国 A 股个股做技术面分析。',
@@ -54,7 +55,7 @@ const INSUFFICIENT_REPLY = 'Data insufficient for reliable analysis';
 const STOCK_TOOL_NAMES = new Set(['analyze_stock', 'analyze_stock_free']);
 
 @Injectable()
-export class ChatOrchestrator {
+export class ChatOrchestrator implements ChatOrchestratorInterface {
   private readonly logger = new Logger(ChatOrchestrator.name);
 
   constructor(

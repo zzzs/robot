@@ -1,0 +1,301 @@
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { ChatAnthropic } from '@langchain/anthropic';
+import {
+  AIMessage,
+  BaseMessage,
+  HumanMessage,
+  SystemMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
+import { DynamicStructuredTool } from '@langchain/core/tools';
+import { Annotation, END, START, StateGraph } from '@langchain/langgraph';
+import { messagesStateReducer } from '@langchain/langgraph';
+import { ChatHistoryService, contentToString } from './chat-history.service';
+import { ChatMessageDto } from './dto/chat-message.dto';
+import { ChatStreamEvent } from './chat-stream.types';
+import { CHAT_MODEL } from './chat.constants';
+import {
+  ANALYZE_STOCK_FREE_TOOL,
+  ANALYZE_STOCK_TOOL,
+  MCP_ANALYSIS_SERVICE,
+  SINA_ANALYSIS_SERVICE,
+} from '../stock/stock.module';
+import { StockAnalysisService } from '../stock/stock-analysis.service';
+import { AnalysisResult, ChartPayload } from '../stock/stock.types';
+import { normalizeTsCode } from '../stock/normalize-ts-code';
+import { ChatOrchestratorInterface } from './chat.service';
+
+/**
+ * ───────────────────────────────────────────────────────────────────────────
+ * LangGraph ReAct 学习版
+ *
+ * 对比 ChatOrchestrator(手写 ReAct 循环),这个版本用 LangGraph 的 StateGraph
+ * 显式声明"状态机",由框架负责循环、消息累积、终止判断。
+ *
+ * 节点 (nodes):
+ *   - agent  : 调 model,产出 AIMessage(可能含 tool_calls)
+ *   - tools  : 自定义工具执行器,跑 analyze 服务,把 chart 推到 state
+ *
+ * 边 (edges):
+ *   START → agent
+ *   agent → tools  (当 AIMessage 有 tool_calls 时)
+ *   agent → END    (当 AIMessage 没有 tool_calls 时)
+ *   tools → agent  (执行完工具回到模型继续推理)
+ *
+ * 状态 (state):
+ *   - messages       : BaseMessage[]  (使用 messagesStateReducer 累积)
+ *   - emittedCharts  : ChartPayload[] (副通道,把图表数据带出 graph)
+ * ───────────────────────────────────────────────────────────────────────────
+ */
+
+// 1️⃣ 定义状态:所有节点共享的"黑板"
+const AgentState = Annotation.Root({
+  // messages 用专用 reducer:相同 id 的消息会被替换而不是追加
+  messages: Annotation<BaseMessage[]>({
+    reducer: messagesStateReducer,
+    default: () => [],
+  }),
+  // 副通道:tools 节点每次往里 push chart_payload,stream 监听者读到就发给前端
+  emittedCharts: Annotation<ChartPayload[]>({
+    reducer: (prev, next) => [...prev, ...next],
+    default: () => [],
+  }),
+});
+
+const SYSTEM_PROMPT = [
+  '你是一个乐于助人的中文助理,擅长一般问答,并对中国 A 股个股做技术面分析。',
+  '',
+  '## 工作流程',
+  '1. 用户提到股票时,**必须调用 analyze_stock_free 工具**(免费、无需 Token)获取真实数据。',
+  '   绝不允许在不调用工具的情况下直接回答股票问题。',
+  '2. 非股票类问题正常用中文回答,不要调用任何工具。',
+  '',
+  '## 调用工具后如何回复',
+  '- status="ok": 用工具返回的 trend.direction、signals 写中文总结(方向、关键信号 1-3 条、置信度)。',
+  '  不要粘贴 OHLCV 或指标数列,图表会自动展示。',
+  '- status="no-data": 原样回复 "No data available for analysis"。',
+  '- status="insufficient": 原样回复 "Data insufficient for reliable analysis"。',
+  '',
+  '## 分析诚信',
+  '绝不捏造数据。仅引用工具返回的实际内容。',
+].join('\n');
+
+const NO_DATA_REPLY = 'No data available for analysis';
+const INSUFFICIENT_REPLY = 'Data insufficient for reliable analysis';
+const MAX_ITER = 8;
+
+@Injectable()
+export class LangGraphOrchestrator implements ChatOrchestratorInterface {
+  private readonly logger = new Logger(LangGraphOrchestrator.name);
+  private readonly compiled;
+
+  constructor(
+    @Inject(CHAT_MODEL) private readonly model: ChatAnthropic,
+    private readonly historySvc: ChatHistoryService,
+    @Inject(ANALYZE_STOCK_FREE_TOOL)
+    private readonly freeTool: DynamicStructuredTool,
+    @Inject(ANALYZE_STOCK_TOOL)
+    private readonly tushareTool: DynamicStructuredTool,
+    @Inject(SINA_ANALYSIS_SERVICE)
+    private readonly sinaAnalysis: StockAnalysisService,
+    @Inject(MCP_ANALYSIS_SERVICE)
+    private readonly mcpAnalysis: StockAnalysisService,
+  ) {
+    // 2️⃣ 把模型绑定工具(让模型能 emit tool_call)
+    const bound = this.model.bindTools([this.freeTool, this.tushareTool]);
+
+    // 3️⃣ 定义 agent 节点:调用模型,拿到 AIMessage
+    const callModel = async (
+      state: typeof AgentState.State,
+    ): Promise<Partial<typeof AgentState.State>> => {
+      const response = await bound.invoke(state.messages, {
+        runName: 'stock-agent (langgraph)',
+        tags: ['langgraph', 'stock-agent'],
+      });
+      return { messages: [response] };
+    };
+
+    // 4️⃣ 定义 tools 节点:自定义执行器(不是 ToolNode)
+    //    用自定义节点是因为我们要把 chart_payload 副通道到 state,
+    //    而标准 ToolNode 只会调 tool.func 返回 ToolMessage。
+    const executeTools = async (
+      state: typeof AgentState.State,
+    ): Promise<Partial<typeof AgentState.State>> => {
+      const last = state.messages[state.messages.length - 1];
+      if (!(last instanceof AIMessage) || !last.tool_calls?.length) {
+        return {};
+      }
+      const newMessages: ToolMessage[] = [];
+      const newCharts: ChartPayload[] = [];
+      for (const tc of last.tool_calls) {
+        const args = (tc.args ?? {}) as Record<string, unknown>;
+        const rawTsCode = typeof args.ts_code === 'string' ? args.ts_code : '';
+        const tsCode = normalizeTsCode(rawTsCode);
+        const range =
+          args.range === 'short' ||
+          args.range === 'medium' ||
+          args.range === 'long'
+            ? args.range
+            : 'medium';
+        if (!tsCode) {
+          newMessages.push(
+            new ToolMessage({
+              tool_call_id: tc.id ?? '',
+              content: JSON.stringify({
+                status: 'no-data',
+                required_reply: NO_DATA_REPLY,
+                reason: `invalid ts_code: ${rawTsCode}`,
+              }),
+            }),
+          );
+          continue;
+        }
+
+        // 选服务:analyze_stock → MCP(Tushare),否则 → Sina(免费)
+        const primary =
+          tc.name === 'analyze_stock' ? this.mcpAnalysis : this.sinaAnalysis;
+        let result = await primary.analyze({
+          ts_code: tsCode,
+          range,
+        });
+
+        // Transparent fallback:Tushare 失败时自动转 Sina
+        if (tc.name === 'analyze_stock' && result.status !== 'ok') {
+          this.logger.warn(`Tushare ${result.status}; falling back to Sina`);
+          result = await this.sinaAnalysis.analyze({ ts_code: tsCode, range });
+        }
+
+        if (result.chart_payload) {
+          newCharts.push(result.chart_payload);
+        }
+        newMessages.push(
+          new ToolMessage({
+            tool_call_id: tc.id ?? '',
+            content: trimmedObservation(result),
+          }),
+        );
+      }
+      return { messages: newMessages, emittedCharts: newCharts };
+    };
+
+    // 5️⃣ 定义条件边路由器:有 tool_calls 去 tools,否则去 END
+    const routeAfterAgent = (state: typeof AgentState.State) => {
+      const last = state.messages[state.messages.length - 1];
+      if (last instanceof AIMessage && last.tool_calls?.length) {
+        return 'tools';
+      }
+      return END;
+    };
+
+    // 6️⃣ 拼装 graph
+    this.compiled = new StateGraph(AgentState)
+      .addNode('agent', callModel)
+      .addNode('tools', executeTools)
+      .addEdge(START, 'agent')
+      .addConditionalEdges('agent', routeAfterAgent)
+      .addEdge('tools', 'agent')
+      .compile();
+  }
+
+  async *stream(dto: ChatMessageDto): AsyncGenerator<ChatStreamEvent> {
+    this.logger.log(
+      `langgraph stream start sessionId=${dto.sessionId} msg=${dto.message.slice(0, 80)}`,
+    );
+
+    // 加载历史 + 当前用户消息
+    const sessionHistory = this.historySvc.get(dto.sessionId);
+    const history = await sessionHistory.getMessages();
+    const human = new HumanMessage(dto.message);
+    await sessionHistory.addMessage(human);
+
+    const initialMessages: BaseMessage[] = [
+      new SystemMessage(SYSTEM_PROMPT),
+      ...history,
+      human,
+    ];
+
+    // 跟踪我们已经发出去的 chart 数量,避免重复发
+    let chartsSent = 0;
+    let chartEmitted = false;
+    let finalText = '';
+
+    // 7️⃣ 调用 compiled graph.stream,选择 stream mode = 'updates'
+    //    'updates' 模式:每个节点完成后,推送 { nodeName: stateDelta }
+    //    多 stream mode 时每个 chunk 是元组 [mode, payload]
+    const stream = await this.compiled.stream(
+      { messages: initialMessages },
+      {
+        recursionLimit: MAX_ITER,
+        configurable: {},
+        streamMode: ['values', 'updates'],
+      },
+    );
+
+    for await (const chunk of stream) {
+      // chunk 是元组:[mode, payload]
+      const [mode, payload] = chunk as [
+        string,
+        (
+          | typeof AgentState.State
+          | Record<string, Partial<typeof AgentState.State>>
+        ),
+      ];
+
+      if (mode === 'values') {
+        const state = payload as typeof AgentState.State;
+        // 新的 chart 到了 → 发出去
+        if (state.emittedCharts) {
+          while (chartsSent < state.emittedCharts.length) {
+            if (!chartEmitted) {
+              chartEmitted = true;
+              yield { type: 'chart', data: state.emittedCharts[chartsSent] };
+            }
+            chartsSent++;
+          }
+        }
+      } else if (mode === 'updates') {
+        const updates = payload as Record<
+          string,
+          Partial<typeof AgentState.State>
+        >;
+        for (const [nodeName, delta] of Object.entries(updates)) {
+          this.logger.log(
+            `node=${nodeName} delta keys=${Object.keys(delta).join(',')}`,
+          );
+          if (nodeName === 'agent' && delta.messages) {
+            // 模型产出新消息 — 把 text 内容流给前端
+            // 注意 AIMessage.content 可能是字符串,也可能是 content blocks 数组
+            // (比如 [{type:'text', text:'...'}]),用 contentToString 统一处理
+            for (const m of delta.messages) {
+              const text = contentToString(m.content);
+              if (text) {
+                finalText += text;
+                yield { type: 'text', content: text };
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 保存最终回答到历史
+    if (finalText) {
+      await this.historySvc.get(dto.sessionId).addAIMessage(finalText);
+    }
+    yield { type: 'done' };
+  }
+}
+
+function trimmedObservation(result: AnalysisResult): string {
+  if (result.status !== 'ok') {
+    return JSON.stringify({
+      status: result.status,
+      required_reply:
+        result.status === 'no-data' ? NO_DATA_REPLY : INSUFFICIENT_REPLY,
+    });
+  }
+  const { chart_payload, indicators, ...rest } = result;
+  void chart_payload;
+  void indicators;
+  return JSON.stringify(rest);
+}

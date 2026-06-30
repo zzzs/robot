@@ -28,4 +28,7 @@ export default () => ({
       process.env.LANGCHAIN_ENDPOINT ?? 'https://api.smith.langchain.com',
     project: process.env.LANGCHAIN_PROJECT ?? 'robot',
   },
+  // Orchestrator 选择:不填或 'manual' 用手写 ChatOrchestrator,
+  // 'langgraph' 切换到 LangGraph 状态机版本(学习用)
+  orchestrator: (process.env.ORCHESTRATOR ?? 'manual').toLowerCase(),
 });
