@@ -25,7 +25,17 @@
 
 [Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
 
-This backend also hosts a **股票分析 (stock-analysis)** capability exposed to the chat agent as a `analyze_stock` tool. Market data is fetched via `@pidanmoe/mcp-stock` (a long-lived child process speaking MCP over stdio, backed by Tushare). Technical indicators (MA / MACD / RSI / BOLL / KDJ) are computed server-side; the chat SSE stream emits typed events (`text | chart | tool-status | done`) so the frontend can render candlestick charts alongside the assistant's summary.
+This backend also hosts a **股票分析 (stock-analysis)** capability exposed to the chat agent as a `analyze_stock` tool. Market data is fetched via `@pidanmoe/mcp-stock` (a long-lived child process speaking MCP over stdio, backed by Tushare) and the free Sina Finance HTTP API (no token required, used as primary). Technical indicators (MA / MACD / RSI / BOLL / KDJ) are computed server-side; the chat SSE stream emits typed events (`text | chart | tool-status | done`) so the frontend can render candlestick charts alongside the assistant's summary.
+
+### Orchestrator modes (set via `ORCHESTRATOR` env var)
+
+| Value | Architecture | When to use |
+|---|---|---|
+| `manual` (default) | Hand-written ReAct loop (`ChatOrchestrator`) | Baseline / learning the manual pattern |
+| `langgraph` | LangGraph StateGraph, single agent (`LangGraphOrchestrator`) | Standard LangGraph ReAct |
+| `supervisor` | Multi-agent: supervisor + researcher + summarizer subgraphs (`SupervisorOrchestrator`) | Multi-agent learning; clearest LangSmith trace |
+
+All three share the same SSE event envelope, integrity rules, and frontend behavior — only the agent topology differs. See `learn/langgraph_react.md` and `learn/supervisor_multiagent.md` for details.
 
 ### Required environment variables
 

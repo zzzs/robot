@@ -29,6 +29,7 @@ export default () => ({
     project: process.env.LANGCHAIN_PROJECT ?? 'robot',
   },
   // Orchestrator 选择:不填或 'manual' 用手写 ChatOrchestrator,
-  // 'langgraph' 切换到 LangGraph 状态机版本(学习用)
+  // 'langgraph' = LangGraph 状态机版本(学习用),
+  // 'supervisor' = supervisor + researcher + summarizer 多 agent 版本(学习用)
   orchestrator: (process.env.ORCHESTRATOR ?? 'manual').toLowerCase(),
 });

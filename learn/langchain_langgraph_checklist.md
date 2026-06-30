@@ -1,0 +1,400 @@
+# LangChain + LangGraph 知识点清单
+
+> 跟着 robot 项目迭代,边学边勾选。
+> ✅ = 项目里用到了(下面标注了文件); ☐ = 还没学; ⭐ = 推荐下一步学
+
+---
+
+## 一、LangChain Core 基础
+
+### 模型与消息
+
+- ✅ `ChatAnthropic` 模型封装 + 自定义 header(走 DashScope 兼容端点)— `chat/providers/chat-chain.provider.ts`
+- ✅ 5 种消息类型:`SystemMessage` / `HumanMessage` / `AIMessage` / `ToolMessage` / `AIMessageChunk`
+- ✅ `BaseMessage[]` 作为对话上下文
+- ✅ `contentToString(content)` 处理 string + content-blocks 数组两种形态 — `chat/chat-history.service.ts`
+- ☐ `@langchain/openai` 的 `ChatOpenAI`(切到 OpenAI 模型)
+- ☐ 多模态:`HumanMessage` 带 image_url / audio
+- ☐ Anthropic 特性:extended thinking、citations、prompt caching
+- ☐ Token 计数(`model.getNumTokensFromMessages`)、上下文窗口管理
+
+### 调用与流式
+
+- ✅ `.invoke(input)` 一次性返回 — `supervisor-orchestrator.ts`
+- ✅ `.stream(input)` 返回 AsyncIterable — `chat.orchestrator.ts`
+- ☐ `.batch(inputs)` 并发批量调用
+- ☐ `astreamEvents` 细粒度事件流(比 stream mode 更精细)
+- ☐ 流式中的 tool_call 拼装 — 项目里手写 `ToolCallAggregator`,LangChain 也提供 helpers
+
+### 工具调用 (Tool Calling)
+
+- ✅ `DynamicStructuredTool` + Zod schema — `stock/tools/*.ts`
+- ✅ `model.bindTools([tool1, tool2])` — 多 orchestrator
+- ✅ `tool_call_chunks` 流式拼装
+- ✅ `DynamicTool`(无 schema 参数的工具)— 还没用,但项目里 stub 是类似形态
+- ☐ `tool()` 工厂函数(比 `new DynamicStructuredTool` 简洁)
+- ☐ `BaseToolkit`(把一组工具打包)
+- ☐ 工具内抛错 / 错误处理最佳实践
+- ☐ 工具结果缓存(`RunnableCache` 或自实现)
+
+### 结构化输出
+
+- ✅ `model.withStructuredOutput(ZodSchema)` — `supervisor-orchestrator.ts`(路由决策)
+- ☐ `response_format: { type: 'json_object' }`(更弱的 JSON 模式)
+- ☐ `withStructuredOutput` + `includeRaw`(同时拿原始 AIMessage)
+- ☐ 解析失败时的 fallback 策略
+
+---
+
+## 二、LCEL (LangChain Expression Language)
+
+LCEL 是 LangChain 自己的"管道"语法。本项目**完全没用**(用了 LangGraph 替代),但学习曲线值得,因为社区资源大量使用。
+
+- ☐ `RunnableSequence` / `.pipe()` 链式组合
+- ☐ `RunnableLambda` 把普通函数变成 Runnable
+- ☐ `RunnablePassthrough` 透传字段
+- ☐ `RunnableBranch` 条件分支(注意:已被 LangGraph 替代)
+- ☐ `RunnableMap` 并行 fan-out
+- ☐ `RunnableWithMessageHistory` 自动接 history(本项目手写替代)
+- ⭐ LCEL stream 的标准模式(`chain.stream` 默认就是 token 级)
+
+---
+
+## 三、Prompt 工程
+
+- ✅ 静态 system prompt + 动态拼接 — 各 orchestrator
+- ☐ `ChatPromptTemplate.fromMessages([...])` 模板化
+- ☐ `MessagesPlaceholder('history')` 历史占位
+- ☐ 模板变量插值 `{variable}`
+- ☐ Few-shot 示例(prompt 里给几个 input/output)
+- ☐ `FewShotChatMessagePromptTemplate`
+- ☐ `SemanticSimilarityExampleSelector` 动态选 few-shot
+- ☐ Prompt Hub / 远程 prompt 仓库
+- ⭐ Prompt 版本化(把 prompt 当代码管理 + A/B test)
+
+---
+
+## 四、Output Parser
+
+LangChain 提供的"把模型字符串输出解析成结构化数据"的工具。本项目用 `withStructuredOutput` 替代,但 output parser 在 RAG / 复杂链路里仍然常用。
+
+- ☐ `StringOutputParser`(最常用,直接拿字符串)
+- ☐ `CommaSeparatedListOutputParser`
+- ☐ `StructuredOutputParser.fromZodSchema(zodSchema)`
+- ☐ `JsonOutputParser`
+- ☐ 自定义 parser (extends `BaseOutputParser`)
+- ☐ Pydantic 风格的输出校验
+
+---
+
+## 五、RAG (检索增强生成) — **整个栈未学**
+
+⚠️ **这是项目最大的空白**。Agent 现在只会调工具拿行情,无法回答"茅台最近的新闻""上一季报怎么说"这类问题。
+
+### 文档加载
+
+- ☐ `PDFLoader` / `WebBaseLoader` / `CSVLoader`
+- ☐ `DirectoryLoader` 批量加载
+- ☐ 自定义 Loader(继承 `BaseDocumentLoader`)
+
+### 文本分割
+
+- ☐ `RecursiveCharacterTextSplitter`(最常用)
+- ☐ `MarkdownTextSplitter` / `CharacterTextSplitter`
+- ☐ chunk size / overlap 调优
+- ☐ 基于结构(token-aware)的分割
+
+### Embeddings
+
+- ☐ `OpenAIEmbeddings` / `CohereEmbeddings`
+- ☐ 本地 embedding(HuggingFace / Ollama)— 国内场景省钱必备
+- ☐ embedding 维度对成本的影响
+
+### Vector Stores
+
+- ☐ `Chroma`(本地开发首选)
+- ☐ `pgvector`(生产首选)
+- ☐ `Pinecone` / `Weaviate` / `Qdrant`
+- ☐ `MemoryVectorProvider`(纯内存,演示用)
+
+### Retrievers
+
+- ☐ `vectorStore.asRetriever()` 基础相似度检索
+- ☐ `MultiQueryRetriever` 让 LLM 改写 query 多次检索
+- ☐ `ContextualCompressionRetriever` 压缩相关片段
+- ☐ `MMRRetriever` 多样化结果
+- ☐ `EnsembleRetriever` 混合检索(BM25 + vector)
+- ☐ Re-ranking(cross-encoder)
+- ☐ HyDE(假设性文档 embedding)
+
+### RAG 模式
+
+- ☐ 基础 RAG 链(query → retrieve → stuff into prompt → answer)
+- ☐ Citations / 引用来源
+- ☐ Self-querying(让 LLM 生成结构化过滤条件)
+- ☐ FLARE (forward-looking active retrieval)
+- ☐ Tree/RAG-Dollar 等高级模式
+
+⭐ **强烈推荐下一步学** —— 加一个 `search_news` 工具走完整 RAG 链路。
+
+---
+
+## 六、Memory (记忆)
+
+### 短期记忆
+
+- ✅ `InMemoryChatMessageHistory`(按 sessionId 隔离)— `chat-history.service.ts`
+- ☐ `BufferWindowMemory`(保留最近 N 轮)
+- ☐ `BufferMemory`(全部历史,无限增长)
+- ☐ `MessagesPlaceholder` 自动注入
+
+### 长期 / 智能记忆
+
+- ☐ `SummaryMemory`(老消息压成 summary)
+- ☐ `ConversationSummaryMemory`
+- ☐ `EntityMemory`(抽取并维护实体,如"用户偏好大盘股")
+- ☐ `VectorStoreRetrieverMemory`(语义检索过去对话)
+- ☐ `MotorheadMemory` / `ZepMemory`(托管服务)
+- ☐ 跨 session 持久化(Postgres / Redis)
+- ⭐ Summary + window 组合(生产最常用)
+
+---
+
+## 七、LangGraph 基础
+
+### Graph 构建
+
+- ✅ `StateGraph(StateAnnotation)` 状态机定义 — `langgraph-orchestrator.ts`
+- ✅ `Annotation.Root({...})` 定义状态字段 + reducer
+- ✅ `messagesStateReducer`(消息专用 reducer)
+- ✅ `addNode('name', fn)` 添加节点
+- ✅ `addEdge(START, 'name')` / `addEdge('name', END)` 固定边
+- ✅ `addConditionalEdges('from', routerFn)` 条件边
+- ✅ `compile()` 编译成可执行 Runnable
+- ☐ `MessagesAnnotation`(预定义 messages-only state,简化样板代码)
+- ☐ 条件边的显式映射对象 `{routeValue: 'targetNode'}`
+- ☐ 多个入口(`addEntryPoint`)
+
+### State 设计
+
+- ✅ 自定义 reducer(`(prev, next) => ...`)
+- ✅ 默认值 (`default: () => ...`)
+- ☐ `lastValue` reducer(单值,新覆盖旧)
+- ☐ `messagesDeltaReducer`
+- ☐ `REMOVE_ALL_MESSAGES` 特殊操作
+- ☐ `RemoveMessage` 显式删除特定消息
+- ☐ 上下文窗口管理(自动 trim 老消息)
+
+### Stream 模式
+
+- ✅ `streamMode: ['values', 'updates']` 多模式组合 — `langgraph-orchestrator.ts`
+- ✅ 多模式时 chunk 是 `[mode, payload]` 元组
+- ☐ `streamMode: 'messages'` 拿 token 级流(关键!当前项目只 invoke,没 token 流)
+- ☐ `streamMode: 'debug'` 看 task 调度细节
+- ☐ `subgraphs: true` 流式子图内部事件
+- ⭐ **token 级流式**(让用户体验大幅提升)
+
+### Pre-built 节点 / Agent
+
+- ☐ `ToolNode`(自动调 tool.func)— 项目里手写了类似的
+- ☐ `createReactAgent`(一行创建 ReAct agent)— 最快上手方式
+- ☐ `createReactAgent` + `stateModifier`(在 LLM 调用前修改 state)
+- ⭐ 试一下 `createReactAgent`,跟手写版对比
+
+---
+
+## 八、LangGraph 进阶
+
+### Subgraph (子图)
+
+- ✅ 子图编译后 `addNode('sub', compiledSubgraph)` 嵌入 — `supervisor-orchestrator.ts`
+- ✅ 子图用相同 state shape 实现 identity 映射
+- ☐ 子图用不同 state shape,显式 state mapping
+- ☐ 多级嵌套(子图里有子图)
+- ☐ 子图独立 compile + 独立单元测试 — ✅ 项目里做到了
+
+### Multi-Agent 模式
+
+- ✅ Supervisor 模式(主管协调多 worker)— `supervisor-orchestrator.ts`
+- ☐ Hierarchical(多 supervisor 嵌套)
+- ☐ Debate 模式(多 agent 辩论,投票)
+- ☐ Pipeline 模式(A → B → C 串行)
+- ☐ Plan-and-Execute(先规划后执行)
+- ☐ Swarm(动态交接)
+- ⭐ Plan-and-Execute 适合复杂多步任务
+
+### 控制流高级
+
+- ☐ `Command` 对象(节点返回 Command 替代 partial state)
+- ☐ `Send(node, state)` 动态分发(并行 fan-out)
+- ☐ `interrupt()` 暂停等用户输入
+- ☐ `interrupt_before` / `interrupt_after` 在特定节点暂停
+- ⭐ HITL(Human-in-the-Loop)是生产必备
+
+### 持久化与状态
+
+- ☐ `MemorySaver`(开发用 in-memory checkpoint)
+- ☐ `SqliteSaver` / `PostgresSaver`(生产持久化)
+- ☐ `getState(config)` / `updateState(config, values)` 状态读取/修改
+- ☐ Time travel(回到历史 checkpoint 重跑)
+- ☐ `BaseStore` / `InMemoryStore`(跨 thread 长期记忆)
+- ☐ Resumable workflows(暂停几天后继续)
+- ⭐ MemorySaver 是 HITL 的前置依赖
+
+---
+
+## 九、Model Context Protocol (MCP)
+
+- ✅ `@modelcontextprotocol/sdk` Client — `mcp-stock.client.ts`
+- ✅ `StdioClientTransport`(子进程 stdio 通信)
+- ✅ `client.callTool({name, arguments})` 调用 MCP 工具
+- ☐ `SSEClientTransport`(HTTP SSE 传输)
+- ☐ `StreamableHTTPClientTransport`(新版 HTTP)
+- ☐ MCP Server 端开发(自己写一个 MCP server)
+- ☐ `client.listTools()` 动态发现工具
+- ☐ `client.getResources()` / `client.getPromptTemplates()`
+- ☐ MCP 资源(MCP 不止是工具,还有 resources / prompts / sampling)
+- ⭐ 写一个自定义 MCP server(比如封装公司的内部 API)
+
+---
+
+## 十、Observability(可观测性)
+
+### LangSmith
+
+- ✅ Tracing 通过 env vars 自动开启 — `.env.example`
+- ✅ `RunnableConfig` 的 `runName` / `tags` / `metadata` 让 trace 可读 — `supervisor-orchestrator.ts`
+- ☐ `traceable()` 包裹非 LangChain 函数 — `sina-client.ts` / `mcp-stock.client.ts` 用了
+- ☐ `LangChainTracer` 自定义 tracer
+- ☐ LangSmith Playground(prompt 调试)
+- ☐ LangSmith Datasets(eval 用例集)
+- ☐ LLM-as-judge 自动评分
+- ☐ LangSmith Compare(A/B 对比 prompt / 模型)
+- ⭐ **Eval 数据集 + LLM-as-judge** — 改 prompt 前必备
+
+### 其他可观测性
+
+- ☐ Langfuse(自部署的替代品)
+- ☐ OpenTelemetry 集成
+- ☐ Phoenix(Arize)
+- ☐ 自定义 callback handler(`BaseCallbackHandler`)
+- ☐ Token / cost 统计 dashboard
+
+---
+
+## 十一、Eval & 测试
+
+- ✅ 普通单元测试(jest + stub service)— `*.spec.ts`
+- ☐ LangSmith Dataset(收集典型问题 + 期望答案)
+- ☐ `RunEvalRequest` API 跑 eval
+- ☐ LLM-as-judge evaluator
+- ☐ `Trajectory` evaluator(评估 agent 整条路径)
+- ☐ Regression testing(改 prompt 后跑全套 eval)
+- ☐ A/B testing(对比两种 prompt)
+- ⭐ **强烈推荐**:本项目诚信规则多,eval 特别必要
+
+---
+
+## 十二、Agent 设计模式
+
+- ✅ ReAct(Reasoning + Acting)— 手写版 + LangGraph 版
+- ✅ Supervisor 多 agent — `supervisor-orchestrator.ts`
+- ☐ Reflection(自我审视 + 重写)
+- ☐ Reflexion(Reflection + 记忆)
+- ☐ Plan-and-Execute
+- ☐ Tree of Thoughts(探索多条路径)
+- ☐ Chain-of-Verification(CoVe,自我验证)
+- ☐ ReWOO(Reasoning WithOut Observation)
+- ☐ Self-Ask
+- ☐ Chain-of-Thought 显式 prompting
+
+---
+
+## 十三、Guardrails / 安全
+
+- ✅ 工具描述里写诚信规则(软约束)— `analyze-stock.tool.ts`
+- ✅ 系统提示词里写诚信规则(软约束)— 各 orchestrator
+- ☐ Output validator(模型输出后 Zod 校验)
+- ☐ Input filter(用户输入过滤)
+- ☐ Prompt injection 防御
+- ☐ PII detection / redaction
+- ☐ Content moderation(LangChain `ModerationChain`)
+- ☐ Constitutional AI / self-critique
+- ☐ Per-user 限流(防 token 滥用)
+
+---
+
+## 十四、Production Engineering
+
+### 部署
+
+- ☐ Docker 化
+- ☐ LangServe(把 chain 暴露为 REST API)
+- ☐ LangGraph Cloud / LangGraph Studio(可视化调试)
+- ☐ Kubernetes / 容器编排
+- ☐ 水平扩展(stateless worker + Redis 协调)
+
+### 性能 / 成本
+
+- ☐ 模型路由(简单问题用小模型,复杂用大模型)
+- ☐ Prompt caching(Anthropic 特性,缓存 prefix)
+- ☐ Anthropic batch API(异步,5折)
+- ☐ 工具结果缓存(Redis)
+- ☐ 并行工具调用
+- ☐ Context window 管理(避免历史爆窗口)
+
+### 错误处理
+
+- ✅ 上游限流重试(429 exponential backoff)— `chat.orchestrator.ts:streamWithRetry`
+- ☐ Circuit breaker(连续失败熔断)
+- ☐ Dead letter queue
+- ☐ Fallback 模型(主模型挂了切备用)
+- ☐ Timeout / cancellation
+
+### 持久化
+
+- ☐ Postgres / Redis 接入(目前全 in-memory)
+- ☐ 用户身份 / 鉴权
+- ☐ 多租户隔离
+- ☐ Audit log
+
+---
+
+## 十五、社区生态
+
+- ☐ LangChain Hub(prompt / agent / tool 仓库)
+- ☐ LangGraph Gallery(官方例子合集)
+- ☐ LangChain Templates(项目模板)
+- ☐ LangSmith CLI
+- ☐ OpenLLMetry(OTel for LLM)
+
+---
+
+## 学习路径建议(已为你按 ROI 排序)
+
+基于你目前已经掌握的(✅),建议按这个顺序往下学:
+
+| 优先级 | 主题 | 为什么 |
+|---|---|---|
+| ⭐⭐⭐ | **LangGraph token 级流式** (`streamMode: 'messages'`) | 用户体验大幅提升,改动小 |
+| ⭐⭐⭐ | **RAG 基础链路** (Loader + Splitter + Embed + Chroma + Retriever) | 项目最大空白,解锁新闻/公告场景 |
+| ⭐⭐⭐ | **Eval 数据集 + LLM-as-judge** | 你这个项目诚信规则多,改 prompt 没评估会失控 |
+| ⭐⭐ | **MemorySaver + HITL** (`interrupt()`) | LangGraph 招牌功能,加"高风险确认"场景 |
+| ⭐⭐ | **`createReactAgent` 对比手写** | 知道什么时候用 prebuilt、什么时候手写 |
+| ⭐⭐ | **Summary Memory** | 当前历史无限增长,迟早会爆 |
+| ⭐ | **Output validator** | 模型乱编数字时能挡住 |
+| ⭐ | **Reflection / Plan-and-Execute 模式** | 提升复杂任务质量 |
+| ⭐ | **MCP Server 端开发** | 写一个封装公司内部 API 的 MCP |
+| ⭐ | **Prompt caching** | Anthropic 特性,长 prompt 省 90% token |
+| ⭐ | **LangServe / Docker 化** | 部署上线 |
+
+---
+
+## 怎么用这份清单
+
+1. 每学完一个知识点,把 ☐ 改成 ✅,在后面标注项目里哪个文件用了
+2. 学完一个 ⭐ 推荐项,优先做小项目落地(比如 RAG → 加 `search_news` 工具)
+3. 季度复盘:看 ☐ 还剩多少,调整学习优先级
+4. 写 PR/commit 时引用清单条目(例如 "实现 ✅ MemorySaver")
+
+学习是一个迭代过程,**不要试图一次学完所有**。每次专注一个主题,落地到代码,然后回头看这份清单更新它。

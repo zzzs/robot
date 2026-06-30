@@ -162,3 +162,30 @@ export interface AnalysisResult {
   latest_bar?: Bar;
   chart_payload?: ChartPayload;
 }
+
+/**
+ * Shared contract between the researcher and summarizer sub-agents in the
+ * supervisor orchestrator. The researcher fills this after running analyze;
+ * the summarizer's prompt only sees this slice (never raw OHLCV).
+ *
+ * - status='pending'  → researcher hasn't run (or chose not to)
+ * - status='ok'       → summarizer should write a trend summary
+ * - status='no-data'  → summarizer must echo integrityReply verbatim
+ * - status='insufficient' → same
+ */
+export type AnalysisContextStatus =
+  | 'pending'
+  | 'ok'
+  | 'no-data'
+  | 'insufficient';
+
+export interface AnalysisContext {
+  status: AnalysisContextStatus;
+  symbol?: string;
+  trend?: Trend;
+  signals?: Signal[];
+  latest_bar?: Bar;
+  latest_quote?: LatestQuote | null;
+  /** The exact integrity string the summarizer must echo, when status !== 'ok'. */
+  integrityReply?: string;
+}

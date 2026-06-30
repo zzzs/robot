@@ -6,6 +6,7 @@ import { ChatHistoryService } from './chat-history.service';
 import { chatModelProvider } from './providers/chat-chain.provider';
 import { ChatOrchestrator } from './chat.orchestrator';
 import { LangGraphOrchestrator } from './langgraph-orchestrator';
+import { SupervisorOrchestrator } from './supervisor-orchestrator';
 import { StockModule } from '../stock/stock.module';
 
 @Module({
@@ -16,20 +17,30 @@ import { StockModule } from '../stock/stock.module';
     ChatHistoryService,
     ChatOrchestrator,
     LangGraphOrchestrator,
+    SupervisorOrchestrator,
     chatModelProvider,
     {
       // 根据 ORCHESTRATOR env 选择实现:
       //   'langgraph' → LangGraph 状态机版本
-      //   其他        → 手写 ChatOrchestrator
+      //   'supervisor' → 多 agent (supervisor + researcher + summarizer)
+      //   其他       → 手写 ChatOrchestrator
       provide: CHAT_ORCHESTRATOR,
-      inject: [ChatOrchestrator, LangGraphOrchestrator, ConfigService],
+      inject: [
+        ChatOrchestrator,
+        LangGraphOrchestrator,
+        SupervisorOrchestrator,
+        ConfigService,
+      ],
       useFactory: (
         manual: ChatOrchestrator,
         langgraph: LangGraphOrchestrator,
+        supervisor: SupervisorOrchestrator,
         config: ConfigService,
       ) => {
         const choice = config.get<string>('orchestrator') ?? 'manual';
-        return choice === 'langgraph' ? langgraph : manual;
+        if (choice === 'langgraph') return langgraph;
+        if (choice === 'supervisor') return supervisor;
+        return manual;
       },
     },
   ],
