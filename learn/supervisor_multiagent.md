@@ -287,6 +287,22 @@ graph.addConditionalEdges(
 4. **Token 优化** — supervisor 用小模型(`qwen-turbo`),summarizer 用大模型(`glm-5.2`)。
 5. **Checkpoint** — MemorySaver 让对话可恢复。
 
+### 已补的:Token 级流式(`subgraphs: true`)
+
+supervisor 模式要让 summarizer 内部的 LLM tokens 流出去给前端,必须在 `compiled.stream()` options 里加 `subgraphs: true`。否则只看到父图节点边界事件,subgraph 内部的 token 事件被吞掉。
+
+```ts
+const stream = await compiled.stream(
+  initialState,
+  {
+    streamMode: ['values', 'updates', 'messages'],
+    subgraphs: true,   // ← 关键!supervisor 模式必须
+  },
+);
+```
+
+详细见 `learn/langgraph_react.md` 的 "Token 级流式" 一节。
+
 ---
 
 ## 九、试一下

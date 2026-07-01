@@ -196,6 +196,55 @@ for await (const [mode, payload] of stream) {
 
 多个 mode 时,chunk 是元组 `[mode, payload]`。
 
+### Token 级流式 (`streamMode: 'messages'`)
+
+最重要的 stream mode。让模型产 token 时立即推送给前端,UX 跟 ChatGPT 一样逐字流入,而不是等模型跑完再 pop-in 整段。
+
+```ts
+const stream = await compiled.stream(
+  { messages: initialMessages },
+  {
+    streamMode: ['values', 'updates', 'messages'],   // ← 加 'messages'
+    subgraphs: true,                                  // ← 仅 supervisor 模式需要
+  },
+);
+
+for await (const [mode, payload] of stream) {
+  if (mode === 'messages') {
+    const [chunk, meta] = payload as [
+      AIMessageChunk,
+      { langgraph_node?: string },
+    ];
+    // 关键:按节点过滤,只转发用户可见节点的 token
+    if (meta.langgraph_node !== 'agent') continue;
+    const text = contentToString(chunk.content);
+    if (text) yield { type: 'text', content: text };
+  }
+}
+```
+
+**关键设计点:**
+
+1. **节点过滤 (`metadata.langgraph_node`)** — supervisor 模式下,`supervisor` 节点的 structured-output JSON tokens 也会触发 'messages' chunks,但那是路由用的 JSON 不是给用户看的,必须按节点名过滤。
+
+2. **`subgraphs: true`** — supervisor 模式下,summarizer 是 subgraph,默认 subgraph 内部的 token 事件不会透传到外层 stream。开这个选项才会。
+
+3. **去重** — 当 LLM 调用结束时,会同时 emit 最后一个 'messages' chunk 和一个带完整 AIMessage 的 'updates' 事件。如果在 'updates' 分支无脑转发文本,用户会看到两遍。修复:
+   - LLM 产的 AIMessage:`response_metadata` 有内容(`stop_reason` 等)→ 'messages' chunks 已经流过,'updates' 不再 forward
+   - 本地构造的 AIMessage(如诚信规则短路):`response_metadata` 是空的 → 没 'messages' chunks → 'updates' forward
+
+   ```ts
+   const isLocallyConstructed = Object.keys(m.response_metadata ?? {}).length === 0;
+   if (!isLocallyConstructed) continue;  // 已通过 messages 流过
+   ```
+
+**对比:**
+
+| 方案 | 首字节延迟 | 实现复杂度 |
+|---|---|---|
+| `model.invoke()` + 整段 emit | 5–15s | 低 |
+| `streamMode: 'messages'` | 200–500ms | 中(需节点过滤 + dedup) |
+
 ---
 
 ## 五、用官方 `createReactAgent` 缩到 5 行

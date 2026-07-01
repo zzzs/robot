@@ -91,6 +91,8 @@ The `/chat/stream` endpoint SHALL emit a typed event sequence so the frontend ca
 
 **Multi-agent additions (when `ORCHESTRATOR=supervisor`):** the same event envelope MUST be emitted by the supervisor orchestrator. SSE consumers MUST NOT need to know which orchestrator produced the events. The chart event MUST be emitted by the researcher subgraph (writing to `state.emittedCharts`), and the analysis-summary / integrity text MUST be emitted by the summarizer subgraph.
 
+**Token 级流式(当 orchestrator 是 `langgraph` 或 `supervisor`):** `text` 事件 MUST 作为** token delta** emit(小 chunk,通常每个 1–20 字符),跟着模型产出节奏 —— 不能是模型跑完后一次性吐整段。适用于所有用户可见的 LLM 输出:`langgraph` 模式的 `agent` 节点响应,`supervisor` 模式的 `summarizer` + `respond_directly` 节点响应。`supervisor` 节点的 structured-output JSON tokens MUST NOT 作为 `text` 事件转发。前端通过 `appendText()` 累积 delta,用户感知到响应是逐字流入的。
+
 #### Scenario: Successful analysis stream
 - **WHEN** the user triggers a successful stock analysis under any of the three orchestrators
 - **THEN** the SSE stream emits, in order: zero or more `text` deltas → one `chart` event → one or more `text` deltas forming the summary → `done: true`
@@ -109,6 +111,23 @@ The `/chat/stream` endpoint SHALL emit a typed event sequence so the frontend ca
 - **WHEN** the same chat message is sent under `manual`, then `langgraph`, then `supervisor`
 - **THEN** the frontend renders indistinguishable event sequences (same types, same field shapes)
 - **AND** the user cannot tell from the UI alone which orchestrator produced the response
+
+#### Scenario: Token-level text streaming under LangGraph orchestrators
+- **WHEN** a `langgraph` or `supervisor` orchestrator processes a chat message that produces user-facing LLM output
+- **THEN** the stream emits multiple small `text` events (each ~1–20 characters) as the model produces each token
+- **AND** the first `text` event arrives within ~500ms of the model starting (not after the full response completes)
+- **AND** the cumulative concatenation of all `text` events equals the full model response
+
+#### Scenario: Supervisor routing tokens are not forwarded
+- **WHEN** the supervisor orchestrator's `supervisor` node invokes the structured-output routing LLM
+- **THEN** the stream MUST NOT emit any `text` events corresponding to those JSON tokens
+- **AND** the user-visible `text` events come exclusively from the `summarizer` or `respond_directly` nodes
+
+#### Scenario: No duplicate text emission
+- **WHEN** a model call completes and LangGraph emits both a final `'messages'` chunk and an `'updates'` event containing the full AIMessage
+- **THEN** the orchestrator forwards the text exactly once (via the `'messages'` chunks)
+- **AND** does NOT also forward it via the `'updates'` branch
+- **AND** the frontend's accumulated bubble shows the text exactly once (not twice)
 
 ### Requirement: Real-time quote overlay marker
 On a successful analysis, the system MUST fetch the latest real-time quote via the MCP `rt_k` tool and attach it to the chart payload as `latest_quote { price, prev_close, open, high, low, volume, change_pct, time }`. The frontend MUST render this as a horizontal price line plus a marker on the rightmost candle. If `rt_k` fails or returns empty, the historical analysis MUST still succeed with `latest_quote: null` (no integrity trip).
@@ -214,3 +233,28 @@ Both worker agents SHALL be implemented as compiled LangGraph subgraphs (`StateG
 - **WHEN** a unit test invokes the researcher subgraph with state `{ messages: [HumanMessage('分析 300033')] }`
 - **THEN** the researcher calls the analyze service and writes `AnalysisContext.status = 'ok'` (or `'no-data'` / `'insufficient'` as appropriate)
 - **AND** no summarizer logic runs
+
+### Requirement: LangGraph orchestrators MUST support streamMode 'messages'
+`LangGraphOrchestrator` 和 `SupervisorOrchestrator` SHALL 在 `compiled.stream()` 时传 `streamMode: ['values', 'updates', 'messages']`。orchestrator 的 stream loop MUST 处理 `'messages'` 模式 —— 从每个 `AIMessageChunk` 抽取文本并作为 SSE `text` 事件 emit。文本抽取 MUST 用现有的 `contentToString` helper,以同时处理字符串 content 和 content-blocks 数组。
+
+#### Scenario: streamMode array includes messages
+- **WHEN** a LangGraph orchestrator invokes `compiled.stream(initialState, options)`
+- **THEN** the `options.streamMode` array includes `'messages'` alongside `'values'` and `'updates'`
+
+#### Scenario: AIMessageChunk text is forwarded as token delta
+- **WHEN** the underlying LLM emits a token chunk during a user-facing node invocation
+- **THEN** the orchestrator's stream loop receives a `['messages', [chunk, metadata]]` tuple
+- **AND** if `metadata.langgraph_node` indicates a user-facing node, the orchestrator yields `{ type: 'text', content: chunkText }` where `chunkText` is the result of `contentToString(chunk.content)`
+
+### Requirement: Supervisor orchestrator MUST enable subgraph event propagation
+supervisor orchestrator SHALL 在 `compiled.stream()` options 里传 `subgraphs: true`,这样 `summarizer` subgraph 内部产生的 token 事件能透传到外层 stream。不开这个选项,只有父图节点的事件可见,summarizer 的 LLM tokens 对 SSE 消费者是不可见的。
+
+#### Scenario: Summarizer tokens propagate through subgraph boundary
+- **WHEN** the summarizer subgraph's `summarize` node invokes the LLM and produces tokens
+- **THEN** those tokens appear in the outer supervisor stream as `['messages', [chunk, { langgraph_node: 'summarizer' }]]` tuples
+- **AND** the orchestrator forwards them as `text` events
+
+#### Scenario: Subgraph token events disabled without the flag
+- **WHEN** stream options does not set `subgraphs: true`
+- **THEN** the outer stream does NOT receive `'messages'` chunks from inside the summarizer subgraph
+- **AND** users see no text streaming (regression — must not happen in production)

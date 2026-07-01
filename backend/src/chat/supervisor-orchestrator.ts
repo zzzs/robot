@@ -7,6 +7,7 @@ import {
   HumanMessage,
   SystemMessage,
 } from '@langchain/core/messages';
+import { DynamicStructuredTool } from '@langchain/core/tools';
 import { Annotation, END, START, StateGraph } from '@langchain/langgraph';
 import { messagesStateReducer } from '@langchain/langgraph';
 import { ChatHistoryService, contentToString } from './chat-history.service';
@@ -94,6 +95,32 @@ const SupervisorState = Annotation.Root({
 
 const MAX_RECURSION = 12;
 
+/**
+ * 本地启发式路由 —— 当 supervisor 的 LLM 路由调用失败时(空响应/quota/限流)
+ * 作为 fallback 使用。比"无脑走 respond_directly"合理:
+ *  - 已有 ok 分析结果 → 走 summarizer(让模型写总结)
+ *  - 看着像股票问题(6 位代码、股票关键词)且没分析过 → 走 researcher
+ *  - 否则 → respond_directly
+ */
+function heuristicRoute(
+  userText: string,
+  analysisStatus: AnalysisContext['status'],
+): RouteDecision['next'] {
+  if (
+    analysisStatus === 'ok' ||
+    analysisStatus === 'no-data' ||
+    analysisStatus === 'insufficient'
+  ) {
+    return 'summarizer';
+  }
+  const looksLikeStock =
+    /\b\d{6}\b/.test(userText) ||
+    /(sh|sz|bj)\d{6}/i.test(userText) ||
+    /(分析|股票|走势|行情|股价|K线)/.test(userText);
+  if (looksLikeStock) return 'researcher';
+  return 'respond_directly';
+}
+
 @Injectable()
 export class SupervisorOrchestrator implements ChatOrchestratorInterface {
   private readonly logger = new Logger(SupervisorOrchestrator.name);
@@ -108,10 +135,20 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
     @Inject(MCP_ANALYSIS_SERVICE)
     private readonly mcpAnalysis: StockAnalysisService,
   ) {
-    // Supervisor routing model: structured output forces Zod-conformant JSON,
-    // eliminating the "model misroutes" class of bug.
-    const supervisorModel = this.model.withStructuredOutput(RouteSchema);
-    // Reuse the same model for the respond_directly node.
+    // Supervisor routing: 用 bindTools 而不是 withStructuredOutput。
+    // 在 Aliyun 的 Anthropic 兼容网关下,withStructuredOutput 默认走 tool_choice
+    // 强制参数,网关似乎丢了那个参数,导致模型不返回 tool_call(返回空)。
+    // bindTools 在 manual / langgraph orchestrator 里已经验证能正常工作,
+    // 这里走同一条路。
+    const routeTool = new DynamicStructuredTool({
+      name: 'route',
+      description:
+        'Decide which sub-agent should handle this user message next. ' +
+        'Call with the appropriate next value based on the routing rules.',
+      schema: RouteSchema,
+      func: (input) => Promise.resolve(JSON.stringify(input)),
+    });
+    const supervisorModel = this.model.bindTools([routeTool]);
     this.respondDirectlyModel = this.model;
 
     // ─── Build subgraphs ──────────────────────────────────────────────
@@ -159,14 +196,36 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
 
       let decision: RouteDecision;
       try {
-        // NOTE: not passing config — see summarizer.subgraph.ts for the
-        // tracer-stack-mismatch rationale (langchain-core 1.2.x bug).
-        decision = await supervisorModel.invoke(routingPrompt);
+        const response = (await supervisorModel.invoke(
+          routingPrompt,
+        )) as AIMessage;
+        // bindTools 的响应:模型应该 emit 一个 tool_call,我们读 args.next
+        const toolCall = response.tool_calls?.[0];
+        const nextValue = toolCall?.args?.next as
+          | RouteDecision['next']
+          | undefined;
+        if (
+          nextValue === 'researcher' ||
+          nextValue === 'summarizer' ||
+          nextValue === 'respond_directly' ||
+          nextValue === 'end'
+        ) {
+          decision = { next: nextValue };
+        } else {
+          // 模型 emit 了 tool_call 但 next 不在 enum 里,或者没 emit tool_call
+          throw new Error(
+            `model returned no valid route tool_call; response_type=${typeof response}, tool_calls_count=${response.tool_calls?.length ?? 0}`,
+          );
+        }
       } catch (err) {
+        // 结构化路由失败(常见原因:模型返回空 / quota / 限流 / 网关不支持 tool_choice)。
+        // 用一个本地启发式做 fallback,而不是无脑走 respond_directly ——
+        // 否则股票问题也会被路由到 respond_directly,体验很差。
+        const fallback = heuristicRoute(userText, state.analysisContext.status);
         this.logger.error(
-          `supervisor routing failed: ${(err as Error).message}; defaulting to respond_directly`,
+          `supervisor routing failed: ${(err as Error).message}; heuristic fallback → ${fallback}`,
         );
-        decision = { next: 'respond_directly' };
+        decision = { next: fallback };
       }
 
       // Force END if we've already produced a final AI text — prevents loops.
@@ -200,11 +259,17 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
     };
 
     const respondDirectlyNode = async (state: typeof SupervisorState.State) => {
-      // NOTE: not passing config — see summarizer.subgraph.ts for rationale.
+      // Anthropic API 要求 SystemMessage 只能是消息列表的第一条。
+      // state.messages 已经有一条 SystemMessage(supervisor mode 标记),
+      // 直接 prepend 会触发 "System messages are only permitted as the first
+      // passed message" 错误。先过滤掉所有 SystemMessage,再 prepend 自己的。
+      const messagesWithoutSystem = state.messages.filter(
+        (m) => !(m instanceof SystemMessage),
+      );
       try {
         const response = await this.respondDirectlyModel.invoke([
           new SystemMessage(RESPOND_DIRECTLY_PROMPT),
-          ...state.messages,
+          ...messagesWithoutSystem,
         ]);
         return { messages: [response as AIMessage] };
       } catch (err) {
@@ -268,18 +333,20 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
       },
       {
         recursionLimit: MAX_RECURSION,
-        streamMode: ['values', 'updates'],
+        // 'messages' 模式产 token chunks;subgraphs:true 让内层 summarizer
+        // subgraph 的 token 事件透传到外层 stream(否则只看到 subgraph 作为
+        // 父图节点的边界事件)。
+        streamMode: ['values', 'updates', 'messages'],
+        subgraphs: true,
       },
     );
 
+    // 只转发用户可见节点的 tokens —— supervisor 节点的 structured-output
+    // JSON tokens 不是给用户看的。
+    const USER_FACING_NODES = new Set(['summarizer', 'respond_directly']);
+
     for await (const chunk of stream) {
-      const [mode, payload] = chunk as [
-        string,
-        (
-          | typeof SupervisorState.State
-          | Record<string, Partial<typeof SupervisorState.State>>
-        ),
-      ];
+      const [mode, payload] = chunk as unknown as [string, unknown];
 
       if (mode === 'values') {
         const state = payload as typeof SupervisorState.State;
@@ -296,6 +363,13 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
           }
         }
       } else if (mode === 'updates') {
+        // 'updates' 分支处理两类事情:
+        //  1. researcher 写入 non-ok status 时 emit tool-status
+        //  2. summarizer/respond_directly 的**短路径** AIMessage(没有走 LLM,
+        //     因此没有 'messages' chunks)—— 这些要 forward 出去
+        // LLM 产出的 AIMessage 不在这里 forward —— 那些通过 'messages' chunks
+        // token-by-token 流出。怎么区分?LLM 产的 AIMessage 有 stop_reason 等
+        // response_metadata;本地构造的(如诚信短路)response_metadata 是空的。
         const updates = payload as Record<
           string,
           Partial<typeof SupervisorState.State>
@@ -306,8 +380,13 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
           );
           // Integrity trip: when researcher writes a non-ok status, emit
           // tool-status BEFORE the summarizer's text reply lands.
+          // subgraphs:true 模式下 nodeName 可能带 namespace 前缀
+          // (如 'supervisor:researcher' 或 'researcher:runResearch'),所以
+          // 用 endsWith 兜底匹配。
           if (
-            nodeName === 'researcher' &&
+            (nodeName === 'researcher' ||
+              nodeName.endsWith(':researcher') ||
+              nodeName.endsWith(':runResearch')) &&
             delta.analysisContext &&
             delta.analysisContext.status !== 'ok' &&
             delta.analysisContext.status !== 'pending'
@@ -318,21 +397,41 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
               message: delta.analysisContext.integrityReply ?? '',
             };
           }
-          // New AIMessage → emit its text content
+          // 短路径 AIMessage:本地构造、没走 LLM → 没 'messages' chunks →
+          // 必须在这里 forward。
+          // 不限制 nodeName —— subgraphs:true 下 nodeName 形态不确定,
+          // 用 response_metadata 是否为空来识别本地构造的消息。
           if (delta.messages) {
             for (const m of delta.messages) {
               if (
-                m instanceof AIMessage &&
-                !(m as AIMessage).tool_calls?.length
+                !(m instanceof AIMessage) ||
+                (m as AIMessage).tool_calls?.length
               ) {
-                const text = contentToString(m.content);
-                if (text) {
-                  finalText += text;
-                  yield { type: 'text', content: text };
-                }
+                continue;
+              }
+              const isLocallyConstructed =
+                Object.keys(m.response_metadata ?? {}).length === 0;
+              if (!isLocallyConstructed) continue;
+              const text = contentToString(m.content);
+              if (text) {
+                finalText += text;
+                yield { type: 'text', content: text };
               }
             }
           }
+        }
+      } else if (mode === 'messages') {
+        // 模型 token chunk —— 只转发用户可见节点的
+        const [chunkMsg, meta] = payload as [
+          { content?: unknown },
+          { langgraph_node?: string },
+        ];
+        const node = meta?.langgraph_node ?? '';
+        if (!USER_FACING_NODES.has(node)) continue;
+        const text = contentToString(chunkMsg.content);
+        if (text) {
+          finalText += text;
+          yield { type: 'text', content: text };
         }
       }
     }

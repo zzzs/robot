@@ -105,14 +105,49 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
     const bound = this.model.bindTools([this.freeTool, this.tushareTool]);
 
     // 3️⃣ 定义 agent 节点:调用模型,拿到 AIMessage
+    //    关键:必须接受并把 config 透传给 model.invoke,否则 LangGraph 的
+    //    'messages' stream mode 拿不到 token 事件(stream transformer 的
+    //    callback 在 config 里)。没有这一步,前端就只收到 done,没文本。
+    //
+    //    另一个坑:启用 streaming callback 后,model.invoke() 返回的是
+    //    AIMessageChunk,不是 AIMessage。chunk 进 state 后,conditional edge
+    //    检查 `m instanceof AIMessage && m.tool_calls?.length` 会失败
+    //    (chunk 的 tool_calls 字段是空的,真实 tool_call 信息存在
+    //    tool_call_chunks 里)。所以这里显式构造一个 AIMessage。
     const callModel = async (
       state: typeof AgentState.State,
+      config: import('@langchain/core/runnables').RunnableConfig,
     ): Promise<Partial<typeof AgentState.State>> => {
       const response = await bound.invoke(state.messages, {
+        ...config,
         runName: 'stock-agent (langgraph)',
-        tags: ['langgraph', 'stock-agent'],
+        tags: [...(config.tags ?? []), 'langgraph', 'stock-agent'],
       });
-      return { messages: [response] };
+      // 显式转成 AIMessage —— 否则 chunk 形态进 state 会破坏 conditional edge
+      const aiMessage = new AIMessage({
+        content: response.content,
+        tool_calls: response.tool_calls,
+        id: response.id,
+        additional_kwargs: response.additional_kwargs,
+        response_metadata: response.response_metadata,
+      });
+      // 诊断:模型到底返回了什么
+      const contentText =
+        typeof aiMessage.content === 'string'
+          ? aiMessage.content
+          : Array.isArray(aiMessage.content)
+            ? aiMessage.content
+                .map((c: unknown) =>
+                  typeof c === 'string'
+                    ? c
+                    : ((c as { text?: string })?.text ?? ''),
+                )
+                .join('')
+            : '';
+      this.logger.log(
+        `agent response: content_len=${contentText.length} tool_calls=${aiMessage.tool_calls?.length ?? 0} response_meta_keys=${Object.keys(aiMessage.response_metadata ?? {}).join(',')}`,
+      );
+      return { messages: [aiMessage] };
     };
 
     // 4️⃣ 定义 tools 节点:自定义执行器(不是 ToolNode)
@@ -181,10 +216,14 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
     // 5️⃣ 定义条件边路由器:有 tool_calls 去 tools,否则去 END
     const routeAfterAgent = (state: typeof AgentState.State) => {
       const last = state.messages[state.messages.length - 1];
-      if (last instanceof AIMessage && last.tool_calls?.length) {
-        return 'tools';
-      }
-      return END;
+      const isAI = last instanceof AIMessage;
+      const tcCount = isAI ? ((last as AIMessage).tool_calls?.length ?? 0) : 0;
+      const route = isAI && tcCount > 0 ? 'tools' : END;
+      // 诊断:看路由判断时 last 是不是 AIMessage、tool_calls 数量、最终路由
+      this.logger.log(
+        `routeAfterAgent: last_type=${last?.constructor?.name ?? 'null'} tool_calls=${tcCount} → ${route}`,
+      );
+      return route;
     };
 
     // 6️⃣ 拼装 graph
@@ -219,27 +258,27 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
     let chartEmitted = false;
     let finalText = '';
 
-    // 7️⃣ 调用 compiled graph.stream,选择 stream mode = 'updates'
-    //    'updates' 模式:每个节点完成后,推送 { nodeName: stateDelta }
+    // 诊断:统计每种 stream mode 的 chunk 数
+    const modeCounts: Record<string, number> = {};
+    let firstMessagesChunkLogged = false;
+
+    // 7️⃣ 调用 compiled graph.stream
+    //    - 'values'  : 状态完整快照(用来检测 emittedCharts 增长)
+    //    - 'updates' : 节点完成后的 delta(用来检测 tool-status 触发)
+    //    - 'messages': 模型产 token 时触发(用来流式 text 给前端)
     //    多 stream mode 时每个 chunk 是元组 [mode, payload]
     const stream = await this.compiled.stream(
       { messages: initialMessages },
       {
         recursionLimit: MAX_ITER,
         configurable: {},
-        streamMode: ['values', 'updates'],
+        streamMode: ['values', 'updates', 'messages'],
       },
     );
 
     for await (const chunk of stream) {
-      // chunk 是元组:[mode, payload]
-      const [mode, payload] = chunk as [
-        string,
-        (
-          | typeof AgentState.State
-          | Record<string, Partial<typeof AgentState.State>>
-        ),
-      ];
+      const [mode, payload] = chunk as unknown as [string, unknown];
+      modeCounts[mode] = (modeCounts[mode] ?? 0) + 1;
 
       if (mode === 'values') {
         const state = payload as typeof AgentState.State;
@@ -254,6 +293,9 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
           }
         }
       } else if (mode === 'updates') {
+        // 注意:'updates' 分支不再抽取文本 —— 文本只通过 'messages' chunks 投递,
+        // 否则会双重发射(详见 add-langgraph-token-streaming change 的 D4 决策)。
+        // 'updates' 只用来打日志和(在 supervisor 模式下)检测 integrity 触发。
         const updates = payload as Record<
           string,
           Partial<typeof AgentState.State>
@@ -262,21 +304,34 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
           this.logger.log(
             `node=${nodeName} delta keys=${Object.keys(delta).join(',')}`,
           );
-          if (nodeName === 'agent' && delta.messages) {
-            // 模型产出新消息 — 把 text 内容流给前端
-            // 注意 AIMessage.content 可能是字符串,也可能是 content blocks 数组
-            // (比如 [{type:'text', text:'...'}]),用 contentToString 统一处理
-            for (const m of delta.messages) {
-              const text = contentToString(m.content);
-              if (text) {
-                finalText += text;
-                yield { type: 'text', content: text };
-              }
-            }
-          }
+        }
+      } else if (mode === 'messages') {
+        // 模型产出 token — 只转发 agent 节点的 chunks(用户可见文本)
+        const [chunkMsg, meta] = payload as [
+          { content?: unknown; id?: string },
+          { langgraph_node?: string; langgraph_step?: number },
+        ];
+        // 诊断:第一个 'messages' chunk 把 metadata 打出来,看 langgraph_node 是什么
+        if (!firstMessagesChunkLogged) {
+          firstMessagesChunkLogged = true;
+          this.logger.log(
+            `first messages chunk: meta=${JSON.stringify(meta)} content_type=${typeof chunkMsg?.content} content_keys=${Array.isArray(chunkMsg?.content) ? 'array' : typeof chunkMsg?.content}`,
+          );
+        }
+        const node = meta?.langgraph_node ?? '';
+        if (node !== 'agent') continue;
+        const text = contentToString(chunkMsg.content);
+        if (text) {
+          finalText += text;
+          yield { type: 'text', content: text };
         }
       }
     }
+
+    // 诊断:输出 mode 统计 + finalText 长度,方便定位"没文本"问题
+    this.logger.log(
+      `stream done. modeCounts=${JSON.stringify(modeCounts)} finalText_len=${finalText.length} charts=${chartsSent}`,
+    );
 
     // 保存最终回答到历史
     if (finalText) {
