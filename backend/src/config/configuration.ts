@@ -32,4 +32,31 @@ export default () => ({
   // 'langgraph' = LangGraph 状态机版本(学习用),
   // 'supervisor' = supervisor + researcher + summarizer 多 agent 版本(学习用)
   orchestrator: (process.env.ORCHESTRATOR ?? 'manual').toLowerCase(),
+  // News RAG 配置 —— 默认走内置 fixture(20 篇 A 股示例新闻,离线可用),
+  // 网络条件允许时改 NEWS_RSS_URLS 换真源(详见 .env.example)
+  news: {
+    rssUrls: process.env.NEWS_RSS_URLS
+      ? process.env.NEWS_RSS_URLS.split(',').map((s) => s.trim())
+      : ['fixture:sample'],
+    ingestCount: Number.parseInt(process.env.NEWS_INGEST_COUNT ?? '50', 10),
+    embeddingModel:
+      process.env.DASHSCOPE_EMBEDDING_MODEL ?? 'text-embedding-v3',
+    embeddingBaseUrl:
+      process.env.DASHSCOPE_EMBEDDING_BASE_URL ??
+      'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    embeddingApiKey: process.env.DASHSCOPE_API_KEY,
+    embeddingBatchSize: Number.parseInt(
+      process.env.NEWS_EMBEDDING_BATCH_SIZE ?? '10',
+      10,
+    ),
+    embeddingBatchDelayMs: Number.parseInt(
+      process.env.NEWS_EMBEDDING_BATCH_DELAY_MS ?? '200',
+      10,
+    ),
+    topK: Number.parseInt(process.env.NEWS_TOP_K ?? '5', 10),
+    // GLM Embedding 配置(embedding-3, OpenAI 兼容)
+    glmApiKey: process.env.GLM_API_KEY,
+    glmBaseUrl:
+      process.env.GLM_BASE_URL ?? 'https://open.bigmodel.cn/api/paas/v4',
+  },
 });

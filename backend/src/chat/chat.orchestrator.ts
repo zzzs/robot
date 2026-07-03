@@ -21,30 +21,32 @@ import {
 } from '../stock/stock.module';
 import { StockAnalysisService } from '../stock/stock-analysis.service';
 import { AnalysisResult } from '../stock/stock.types';
+import { SEARCH_NEWS_TOOL } from '../news/news-rag.module';
 import { normalizeTsCode } from '../stock/normalize-ts-code';
 import { ChatOrchestratorInterface } from './chat.service';
 
 const SYSTEM_PROMPT = [
-  '你是一个乐于助人的中文助理,擅长一般问答,并对中国 A 股个股做技术面分析。',
+  '你是一个乐于助人的中文助理,擅长一般问答,并对中国 A 股个股做技术面分析 + 新闻检索。',
   '',
-  '## 工作流程',
-  '1. 用户提到股票(代码或名称,如 "300033"、"600519.SH"、"贵州茅台"、"分析一下平安银行")时,',
-  '   **必须调用 analyze_stock_free 工具**(免费、无需 Token)获取真实数据。',
-  '   拿到 status="ok" 后直接写总结,不要重复调用或换其他工具重试。',
-  '   绝不允许在不调用工具的情况下直接回答股票问题。',
-  '2. 非股票类问题(天气、闲聊、编程等)正常用中文回答,不要调用任何工具。',
+  '## 工具选择',
+  '- **analyze_stock_free**:用户问 K 线 / 走势 / 技术指标 / 趋势分析时调用。',
+  '- **search_news**:用户问"最近有什么新闻 / 消息 / 公告"或"X 最近出什么事了"时调用。',
+  '- 都不适用 → 直接用中文回答,不调任何工具。',
   '',
-  '## 调用工具后如何回复',
-  '工具会返回一个 JSON,其中的 `status` 字段决定你的下一步行为:',
-  '- status="ok": 基于工具返回的 trend.direction、trend.confidence、signals,',
-  '  写一段中文总结(方向、关键信号 1-3 条、置信度)。不要粘贴 OHLCV 或指标数列,图表会自动展示。',
-  '- status="no-data": 用工具返回的 required_reply 字段原样回复(通常是英文 "No data available for analysis"),',
-  '  然后停止。不要在调用工具前就回复这句话。',
-  '- status="insufficient": 同理,用 required_reply 原样回复(通常是 "Data insufficient for reliable analysis")。',
+  '## 调用 analyze_stock_free 后',
+  '工具返回 JSON,`status` 字段决定行为:',
+  '- status="ok":基于 trend.direction、trend.confidence、signals 写中文总结。',
+  '  不要粘贴 OHLCV 或指标数列,图表会自动展示。',
+  '- status="no-data":用 required_reply 原样回复 "No data available for analysis",停止。',
+  '- status="insufficient":同理,原样回复 "Data insufficient for reliable analysis"。',
+  '',
+  '## 调用 search_news 后',
+  '工具返回编号片段([1]/[2]/...),每条带 title + 日期 + 链接 + 内容摘要。',
+  '写总结时**必须**引用至少一个编号,例如"据 [1] 报道..."。',
+  '如果工具返回 loading/empty/failed 等提示,如实告知用户,不要编造新闻。',
   '',
   '## 分析诚信',
-  '绝不捏造、估算或幻觉任何价格、指标或信号。仅引用工具返回的数据。',
-  '信号矛盾或置信度过低时使用"震荡 / 无明确趋势"等中性表述,不要强行给方向。',
+  '绝不捏造、估算或幻觉任何价格、指标、信号或新闻。仅引用工具返回的数据。',
 ].join('\n');
 
 const MAX_ITER = 4;
@@ -65,6 +67,8 @@ export class ChatOrchestrator implements ChatOrchestratorInterface {
     private readonly tushareTool: DynamicStructuredTool,
     @Inject(ANALYZE_STOCK_FREE_TOOL)
     private readonly freeTool: DynamicStructuredTool,
+    @Inject(SEARCH_NEWS_TOOL)
+    private readonly searchNewsTool: DynamicStructuredTool,
     @Inject(MCP_ANALYSIS_SERVICE)
     private readonly mcpAnalysis: StockAnalysisService,
     @Inject(SINA_ANALYSIS_SERVICE)
@@ -86,7 +90,11 @@ export class ChatOrchestrator implements ChatOrchestratorInterface {
       human,
     ];
 
-    const bound = this.model.bindTools([this.freeTool, this.tushareTool]);
+    const bound = this.model.bindTools([
+      this.freeTool,
+      this.tushareTool,
+      this.searchNewsTool,
+    ]);
 
     let finalText = '';
     // Track emissions across ALL iterations to prevent duplicate UI events.
@@ -186,6 +194,31 @@ export class ChatOrchestrator implements ChatOrchestratorInterface {
       );
 
       for (const tc of toolCalls) {
+        // search_news(RAG 检索)—— 跟 analyze_stock 走不同路径
+        if (tc.name === 'search_news') {
+          const query = typeof tc.args?.query === 'string' ? tc.args.query : '';
+          try {
+            const result = (await this.searchNewsTool.invoke({
+              query,
+            })) as string;
+            messages.push(
+              new ToolMessage({
+                tool_call_id: tc.id ?? '',
+                content:
+                  typeof result === 'string' ? result : JSON.stringify(result),
+              }),
+            );
+          } catch (err) {
+            messages.push(
+              new ToolMessage({
+                tool_call_id: tc.id ?? '',
+                content: `news search error: ${(err as Error).message}`,
+              }),
+            );
+          }
+          continue;
+        }
+
         // Normalize the tool name so the rest of the loop only deals with two known values.
         if (!STOCK_TOOL_NAMES.has(tc.name)) {
           this.logger.warn(

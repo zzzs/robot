@@ -56,6 +56,19 @@ Copy `backend/.env.example` to `backend/.env` and fill in `TUSHARE_TOKEN`.
 - If the child crashes it is automatically restarted on the next call.
 - Integrity rules are non-negotiable: empty or insufficient data MUST trip `"No data available for analysis"` / `"Data insufficient for reliable analysis"` exactly. These strings are enforced in both the tool description and the chat system prompt.
 
+### News RAG (auto-enabled on boot)
+
+The backend also hosts a RAG pipeline that fetches latest A-share news from Sina Finance RSS, splits into chunks, embeds via DashScope, and stores in `MemoryVectorStore`. The chat agent has a third tool `search_news` for answering "what's the latest news on X" questions.
+
+- **Auto-ingest at startup** (background, doesn't block chat): ~30s for 50 articles × ~5 chunks = ~250 embeddings
+- **During ingest**: `search_news` returns "loading, retry in a few seconds"
+- **On failure** (RSS down, bad API key): warn log, tool degrades to "news database failed", chat still works
+- **Tunable via env**: `NEWS_RSS_URLS`, `NEWS_INGEST_COUNT`, `NEWS_TOP_K`, `DASHSCOPE_EMBEDDING_MODEL`
+
+Currently registered in `manual` + `langgraph` orchestrators. Supervisor mode integration deferred (would need a new "news_researcher" sub-agent).
+
+See `learn/news_rag.md` for the full RAG walkthrough.
+
 ### Tracing with LangSmith (optional but strongly recommended)
 
 Every chat request, model call, and tool execution is auto-traced when `LANGCHAIN_TRACING_V2=true` and `LANGCHAIN_API_KEY` are set. No code changes needed — LangChain Core reads these env vars on startup.

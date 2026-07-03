@@ -8,9 +8,10 @@ import { ChatOrchestrator } from './chat.orchestrator';
 import { LangGraphOrchestrator } from './langgraph-orchestrator';
 import { SupervisorOrchestrator } from './supervisor-orchestrator';
 import { StockModule } from '../stock/stock.module';
+import { NewsRagModule } from '../news/news-rag.module';
 
 @Module({
-  imports: [StockModule],
+  imports: [StockModule, NewsRagModule],
   controllers: [ChatController],
   providers: [
     ChatService,

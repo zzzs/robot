@@ -24,6 +24,7 @@ import { StockAnalysisService } from '../stock/stock-analysis.service';
 import { AnalysisResult, ChartPayload } from '../stock/stock.types';
 import { normalizeTsCode } from '../stock/normalize-ts-code';
 import { ChatOrchestratorInterface } from './chat.service';
+import { SEARCH_NEWS_TOOL } from '../news/news-rag.module';
 
 /**
  * ───────────────────────────────────────────────────────────────────────────
@@ -63,18 +64,23 @@ const AgentState = Annotation.Root({
 });
 
 const SYSTEM_PROMPT = [
-  '你是一个乐于助人的中文助理,擅长一般问答,并对中国 A 股个股做技术面分析。',
+  '你是一个乐于助人的中文助理,擅长一般问答,并对中国 A 股个股做技术面分析 + 新闻检索。',
   '',
-  '## 工作流程',
-  '1. 用户提到股票时,**必须调用 analyze_stock_free 工具**(免费、无需 Token)获取真实数据。',
-  '   绝不允许在不调用工具的情况下直接回答股票问题。',
-  '2. 非股票类问题正常用中文回答,不要调用任何工具。',
+  '## 工具选择',
+  '- **analyze_stock_free**:用户问 K 线 / 走势 / 技术指标 / 趋势分析时调用。',
+  '- **search_news**:用户问"最近有什么新闻 / 消息 / 公告"或"X 最近出什么事了"时调用。',
+  '- 都不适用 → 直接用中文回答,不调任何工具。',
   '',
-  '## 调用工具后如何回复',
-  '- status="ok": 用工具返回的 trend.direction、signals 写中文总结(方向、关键信号 1-3 条、置信度)。',
+  '## 调用 analyze_stock_free 后',
+  '- status="ok": 用 trend.direction、signals 写中文总结(方向、关键信号 1-3 条、置信度)。',
   '  不要粘贴 OHLCV 或指标数列,图表会自动展示。',
   '- status="no-data": 原样回复 "No data available for analysis"。',
   '- status="insufficient": 原样回复 "Data insufficient for reliable analysis"。',
+  '',
+  '## 调用 search_news 后',
+  '工具返回编号片段([1]/[2]/...),每条带 title + 日期 + 链接 + 内容摘要。',
+  '写总结时**必须**引用至少一个编号,例如"据 [1] 报道..."。',
+  '如果工具返回 loading/empty/failed 等提示,如实告知用户,不要编造新闻。',
   '',
   '## 分析诚信',
   '绝不捏造数据。仅引用工具返回的实际内容。',
@@ -96,13 +102,19 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
     private readonly freeTool: DynamicStructuredTool,
     @Inject(ANALYZE_STOCK_TOOL)
     private readonly tushareTool: DynamicStructuredTool,
+    @Inject(SEARCH_NEWS_TOOL)
+    private readonly searchNewsTool: DynamicStructuredTool,
     @Inject(SINA_ANALYSIS_SERVICE)
     private readonly sinaAnalysis: StockAnalysisService,
     @Inject(MCP_ANALYSIS_SERVICE)
     private readonly mcpAnalysis: StockAnalysisService,
   ) {
     // 2️⃣ 把模型绑定工具(让模型能 emit tool_call)
-    const bound = this.model.bindTools([this.freeTool, this.tushareTool]);
+    const bound = this.model.bindTools([
+      this.freeTool,
+      this.tushareTool,
+      this.searchNewsTool,
+    ]);
 
     // 3️⃣ 定义 agent 节点:调用模型,拿到 AIMessage
     //    关键:必须接受并把 config 透传给 model.invoke,否则 LangGraph 的
@@ -164,6 +176,31 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
       const newCharts: ChartPayload[] = [];
       for (const tc of last.tool_calls) {
         const args = (tc.args ?? {}) as Record<string, unknown>;
+
+        // search_news(RAG 检索)—— 跟 analyze_stock 走不同路径
+        if (tc.name === 'search_news') {
+          const query = typeof args.query === 'string' ? args.query : '';
+          try {
+            const result = (await this.searchNewsTool.invoke({
+              query,
+            })) as string;
+            newMessages.push(
+              new ToolMessage({
+                tool_call_id: tc.id ?? '',
+                content:
+                  typeof result === 'string' ? result : JSON.stringify(result),
+              }),
+            );
+          } catch (err) {
+            newMessages.push(
+              new ToolMessage({
+                tool_call_id: tc.id ?? '',
+                content: `news search error: ${(err as Error).message}`,
+              }),
+            );
+          }
+          continue;
+        }
         const rawTsCode = typeof args.ts_code === 'string' ? args.ts_code : '';
         const tsCode = normalizeTsCode(rawTsCode);
         const range =
