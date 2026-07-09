@@ -4,6 +4,7 @@ import configuration from './config/configuration';
 import { ChatModule } from './chat/chat.module';
 import { StockModule } from './stock/stock.module';
 import { NewsRagModule } from './news/news-rag.module';
+import { EvalModule } from './eval/eval.module';
 
 @Module({
   imports: [
@@ -11,6 +12,7 @@ import { NewsRagModule } from './news/news-rag.module';
     StockModule,
     NewsRagModule,
     ChatModule,
+    EvalModule,
   ],
 })
 export class AppModule {}

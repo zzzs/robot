@@ -8,7 +8,8 @@ import { Document } from '@langchain/core/documents';
 interface FixtureArticle {
   title: string;
   link: string;
-  pubDate: string;
+  pubDate?: string;
+  daysAgo?: number;
   content: string;
 }
 
@@ -119,10 +120,23 @@ export class NewsLoaderService {
             'fixture:sample not found in any candidate path; check dist/ layout',
           );
         }
-        return fixture.slice(0, limit).map((a) => ({
-          ...a,
-          source: 'fixture:sample',
-        }));
+        return fixture.slice(0, limit).map((a) => {
+          // fixture 用 daysAgo(相对天数)避免硬编码日期过期
+          // 启动时动态算:今天是 7 号,daysAgo=2 → 5 号
+          let pubDate = a.pubDate ?? '';
+          if (!pubDate && typeof a.daysAgo === 'number') {
+            const d = new Date();
+            d.setDate(d.getDate() - a.daysAgo);
+            pubDate = d.toISOString().slice(0, 19).replace('T', ' ');
+          }
+          return {
+            title: a.title,
+            link: a.link,
+            pubDate,
+            content: a.content,
+            source: 'fixture:sample',
+          };
+        });
       }
       this.logger.warn(`unknown fixture: ${name}`);
       return [];

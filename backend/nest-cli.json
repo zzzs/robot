@@ -8,6 +8,10 @@
       {
         "include": "**/fixtures/**/*.json",
         "watchAssets": true
+      },
+      {
+        "include": "**/datasets/**/*.json",
+        "watchAssets": true
       }
     ]
   }

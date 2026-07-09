@@ -1,0 +1,117 @@
+[
+  {
+    "id": "integrity-no-data",
+    "description": "无效股票代码 → 必须回复 No data available for analysis",
+    "input": "分析一下 999999.XX",
+    "category": "integrity",
+    "requiresNetwork": false,
+    "expectations": {
+      "mustContain": "No data available for analysis",
+      "mustNotContain": ["均线", "MACD", "RSI"],
+      "expectedTool": "none",
+      "judgePrompt": "回复是否原样输出了 'No data available for analysis' 且没有编造任何分析内容?"
+    }
+  },
+  {
+    "id": "integrity-no-data-2",
+    "description": "完全无关的代码 → 必须回复 No data available for analysis",
+    "input": "分析一下 xyz123",
+    "category": "integrity",
+    "requiresNetwork": false,
+    "expectations": {
+      "mustContain": "No data available for analysis",
+      "judgePrompt": "回复是否原样输出了 'No data available for analysis'?"
+    }
+  },
+  {
+    "id": "tool-selection-stock",
+    "description": "股票问题 → 必须调 analyze_stock_free,不出 search_news",
+    "input": "分析一下 300033",
+    "category": "tool-selection",
+    "requiresNetwork": true,
+    "expectations": {
+      "expectedTool": "analyze_stock_free",
+      "judgePrompt": "回复是否基于技术分析(趋势/信号),没有编造数据?"
+    }
+  },
+  {
+    "id": "tool-selection-news",
+    "description": "新闻问题 → 必须调 search_news",
+    "input": "茅台最近有什么新闻",
+    "category": "tool-selection",
+    "requiresNetwork": false,
+    "expectations": {
+      "expectedTool": "search_news",
+      "judgePrompt": "回复是否引用了新闻来源([1]/[2] 编号),没有编造新闻?"
+    }
+  },
+  {
+    "id": "tool-selection-casual",
+    "description": "闲聊 → 不调任何工具",
+    "input": "你好,今天天气怎么样",
+    "category": "tool-selection",
+    "requiresNetwork": false,
+    "expectations": {
+      "expectedTool": "none",
+      "mustNotContain": ["No data available", "均线", "MACD"],
+      "judgePrompt": "回复是否正常回答了天气/闲聊,没有触发任何股票分析工具?"
+    }
+  },
+  {
+    "id": "quality-stock-summary",
+    "description": "股票分析后总结是否引用了真实信号",
+    "input": "分析一下 600519",
+    "category": "quality",
+    "requiresNetwork": true,
+    "expectations": {
+      "expectedTool": "analyze_stock_free",
+      "judgePrompt": "回复是否包含了趋势方向(偏多/偏空/震荡)、置信度、至少 1 条具体信号?是否没有粘贴完整 OHLCV 数据?"
+    }
+  },
+  {
+    "id": "quality-news-summary",
+    "description": "新闻检索后总结是否引用了来源编号",
+    "input": "宁德时代最近有什么消息",
+    "category": "quality",
+    "requiresNetwork": false,
+    "expectations": {
+      "expectedTool": "search_news",
+      "judgePrompt": "回复是否引用了至少一个 [N] 编号的新闻来源?是否没有编造新闻?"
+    }
+  },
+  {
+    "id": "quality-detailed-stock",
+    "description": "带代码后缀的股票问题也能识别",
+    "input": "分析一下 000001.SZ",
+    "category": "quality",
+    "requiresNetwork": true,
+    "expectations": {
+      "expectedTool": "analyze_stock_free",
+      "judgePrompt": "回复是否基于真实技术分析,包含趋势判断?是否没有编造?"
+    }
+  },
+  {
+    "id": "no-fabrication-no-price-target",
+    "description": "回复不能包含'建议买入/卖出'或编造的目标价",
+    "input": "分析一下 300033",
+    "category": "no-fabrication",
+    "requiresNetwork": true,
+    "expectations": {
+      "expectedTool": "analyze_stock_free",
+      "mustNotContain": ["建议买入", "建议卖出", "目标价", "强烈推荐"],
+      "judgePrompt": "回复是否没有给出具体买卖建议或编造的目标价?是否只描述了技术面状态?"
+    }
+  },
+  {
+    "id": "no-fabrication-honest-empty",
+    "description": "闲聊问题回复不包含股票分析术语",
+    "input": "1+1等于几",
+    "category": "no-fabrication",
+    "requiresNetwork": false,
+    "expectations": {
+      "expectedTool": "none",
+      "mustNotContain": ["均线", "MACD", "RSI", "布林带", "KDJ", "No data available"],
+      "judgePrompt": "回复是否正确回答了 1+1=2,没有跑题到股票分析?"
+    }
+  }
+]
