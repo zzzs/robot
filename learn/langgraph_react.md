@@ -247,14 +247,17 @@ for await (const [mode, payload] of stream) {
 
 ---
 
-## 五、用官方 `createReactAgent` 缩到 5 行
+## 五、用官方 `createAgent` 缩到 5 行
 
-上面的 `agent + tools + router` 是标准 ReAct 模式,LangGraph 提供了**一行创建**的封装:
+> ⚠️ **API 变更(2026):** `createReactAgent` 已从 `@langchain/langgraph/prebuilt` **弃用**,已迁移到 `langchain` 包并重命名为 `createAgent`。旧导入仍可用但会有 deprecation warning。
+
+上面的 `agent + tools + router` 是标准 ReAct 模式,`langchain` 包提供了**一行创建**的封装:
 
 ```ts
-import { createReactAgent } from '@langchain/langgraph/prebuilt';
+// 新 API(推荐):从 langchain 包导入
+import { createAgent } from 'langchain';
 
-const agent = createReactAgent({
+const agent = createAgent({
   llm: model,
   tools: [freeTool, tushareTool],
 });
@@ -262,9 +265,22 @@ const agent = createReactAgent({
 const result = await agent.invoke({ messages: [...] });
 ```
 
+**迁移指南:**
+```ts
+// 旧(弃用):
+import { createReactAgent } from '@langchain/langgraph/prebuilt';
+const agent = createReactAgent({ llm: model, tools: [...] });
+
+// 新(推荐):
+import { createAgent } from 'langchain';
+const agent = createAgent({ llm: model, tools: [...] });
+```
+
+**`ToolNode` 和 `toolsCondition` 没有弃用** —— 仍在 `@langchain/langgraph/prebuilt`,可以单独使用。
+
 **对比我们手写的 200 行:**
 
-| 你手写的 | `createReactAgent` 自动给的 |
+| 你手写的 | `createAgent` 自动给的 |
 |---|---|
 | callModel 函数 | ✅ |
 | executeTools / ToolNode | ✅(用 ToolNode,不走我们自定义的副通道) |
@@ -274,10 +290,10 @@ const result = await agent.invoke({ messages: [...] });
 
 **那为什么我们还要手写一遍?**
 
-因为标准 `createReactAgent` 的 ToolNode 会调 `tool.func`,而我们的 `func` 故意只返回 trimmed JSON(不带 chart_payload)。要让 chart 走副通道,就需要**自定义 tools 节点**。学习目的下,手写比用 prebuilt 更能理解原理。
+因为标准 `createAgent` 的 ToolNode 会调 `tool.func`,而我们的 `func` 故意只返回 trimmed JSON(不带 chart_payload)。要让 chart 走副通道,就需要**自定义 tools 节点**。学习目的下,手写比用 prebuilt 更能理解原理。
 
 **生产环境的选择:**
-- 简单 ReAct + 标准 tool → `createReactAgent` 一把梭
+- 简单 ReAct + 标准 tool → `createAgent` 一把梭
 - 需要副通道 / 多 agent / 复杂路由 → 手写 StateGraph
 
 ---
