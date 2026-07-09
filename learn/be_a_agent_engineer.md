@@ -320,7 +320,232 @@ ChatOrchestrator.stream()                ← 手写的 Agent 主循环
 | RAG | 检索增强生成 | ❌ 没做 |
 | Structured Output | 强类型 JSON 输出 | ❌ 没做 |
 | HITL | 关键步骤暂停等用户确认 | ❌ 没做 |
-| Eval | 给 agent 打分,防退化 | ❌ 没做 |
-| Tracing | 看清每一步在干什么 | 只用 `Logger` 打了文本日志 |
+| Eval | 给 agent 打分,防退化 | ✅ eval-framework |
+| Tracing | 看清每一步在干什么 | ✅ LangSmith + `traceable()` |
+
+--- 
+
+## 六、SSE 流式响应实现详解
+
+> "后端怎么把 agent 的逐 token 输出推到前端" 是 agent 开发的核心基础设施。
+> 项目用 NestJS `@Sse` + RxJS `Observable` + `AsyncGenerator` 三层组合实现。
+
+### 整体架构
+
+```
+浏览器 EventSource
+    ↓  GET /api/chat/stream?sessionId=xxx&message=yyy
+    ↓
+NestJS @Sse('stream') 装饰器
+    ↓  返回 Observable<MessageEvent>
+    ↓
+RxJS Observable (桥接层)
+    ↓  内部 IIFE 消费 AsyncGenerator
+    ↓
+ChatService.stream() → AsyncGenerator<ChatStreamEvent>
+    ↓  yield { type: 'text', content: '你' }
+    ↓  yield { type: 'text', content: '好' }
+    ↓  yield { type: 'chart', data: {...} }
+    ↓  yield { type: 'done' }
+    ↓
+Orchestrator (LangGraph/Manual/Supervisor)
+    ↓  graph.stream() 或 bound.stream()
+    ↓
+LLM + Tools
+```
+
+### 逐层解析
+
+#### 1. 前端: `EventSource`(浏览器原生 SSE 客户端)
+
+```ts
+// frontend/src/hooks/useChat.ts
+const es = new EventSource(url);
+es.onmessage = (ev) => {
+  const payload = JSON.parse(ev.data) as ChatStreamEvent;
+  switch (payload.type) {
+    case 'text':        appendText(payload.content); break;
+    case 'chart':       pushBubble({ kind: 'chart', data: payload.data }); break;
+    case 'interrupt':   showConfirmDialog(payload); break;
+    case 'done':        es.close(); break;
+  }
+};
+```
+
+**关键点:**
+- `EventSource` 是浏览器原生 API,不需要任何库
+- 自动重连(但本项目不用,`done` 后手动 close)
+- 只支持 GET 请求 → 所以 message 和 sessionId 放在 query 参数里,不是 body
+- 每条消息的 `ev.data` 是字符串,需要 `JSON.parse`
+
+**为什么不用 WebSocket?**
+- SSE 是单向(服务器→客户端),正好够用
+- WebSocket 是双向,但需要额外的握手/心跳/重连逻辑
+- SSE 用 HTTP/1.1 长连接,部署简单(不需要 WebSocket proxy)
+
+#### 2. 后端: NestJS `@Sse` 装饰器
+
+```ts
+// backend/src/chat/chat.controller.ts
+@Sse('stream')
+@UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
+stream(@Query() dto: ChatMessageDto): Observable<MessageEvent> {
+  return new Observable<MessageEvent>((subscriber) => { ... });
+}
+```
+
+**`@Sse` 做了什么:**
+- 设置 HTTP 响应头: `Content-Type: text/event-stream`
+- 设置 `Cache-Control: no-cache`
+- 设置 `Connection: keep-alive`
+- 把返回的 `Observable<MessageEvent>` 订阅,每个 `subscriber.next(event)` 自动写成 `data: {...}\n\n` 格式推给客户端
+- `subscriber.complete()` 时关闭 HTTP 连接
+
+**`MessageEvent` 类型:**
+```ts
+interface MessageEvent {
+  data: unknown;    // 序列化后作为 SSE data 行
+  id?: string;       // SSE event ID(用于断线重连)
+  event?: string;    // SSE event 类型(本项目不用,统一用默认 message)
+  retry?: number;    // 重连间隔(ms)
+}
+```
+
+#### 3. 桥接层: RxJS `Observable` ↔ `AsyncGenerator`
+
+这是**最关键的一层** —— NestJS 的 `@Sse` 要求返回 `Observable`,但 Orchestrator 返回的是 `AsyncGenerator`。需要手动桥接:
+
+```ts
+return new Observable<MessageEvent>((subscriber) => {
+  let cancelled = false;
+
+  // IIFE 启动异步消费循环
+  (async () => {
+    try {
+      const iter = this.chatService.stream(dto);  // AsyncGenerator
+      for await (const ev of iter) {              // 逐个消费
+        if (cancelled) break;                     // 客户端断开时停止
+        subscriber.next(toMessageEvent(ev));       // → 推给 SSE
+        if (ev.type === 'interrupt') {
+          subscriber.complete();                   // HITL: 关闭连接等 resume
+          return;
+        }
+        if (ev.type === 'done') {
+          subscriber.complete();                   // 正常结束
+          return;
+        }
+      }
+    } catch (err) {
+      subscriber.error(err);                      // 异常 → SSE error
+    }
+  })();
+
+  // 返回 teardown 函数 —— 客户端断开时调用
+  return () => {
+    cancelled = true;
+  };
+});
+```
+
+**为什么要桥接?**
+
+| AsyncGenerator | Observable |
+|---|---|
+| pull 模型(消费者主动 `for await`) | push 模式(生产者 `subscriber.next`) |
+| 原生 JS 语法 | RxJS 库提供 |
+| Orchestrator 自然产出 | NestJS `@Sse` 自然消费 |
+
+两者不能直接对接,需要 IIFE 手动消费 generator 并 push 给 subscriber。
+
+**`cancelled` 标志的作用:**
+用户关掉浏览器/导航走 → HTTP 连接断 → NestJS 调用 teardown 函数 → `cancelled = true` → `for await` 循环下一轮检测到 break → 停止消费 generator。防止后端继续做无用的 LLM 调用。
+
+#### 4. 数据层: `ChatStreamEvent` 类型
+
+```ts
+type ChatStreamEvent =
+  | { type: 'text'; content: string }            // token delta
+  | { type: 'chart'; data: ChartPayload }        // 完整图表数据
+  | { type: 'tool-status'; status; message }     // 诚信规则触发
+  | { type: 'interrupt'; reason; confirmLabel }  // HITL 暂停
+  | { type: 'done' }                             // 流结束
+```
+
+**设计要点:**
+- 前后端**共享同一个类型定义**(`types.ts` / `chat-stream.types.ts`)
+- `text` 是 **delta**(增量),前端累积拼接,不是整段替换
+- `chart` 是**一次性完整数据**,不是流式分片(图表数据太大不适合分片)
+- `interrupt` 后**不跟 `done`** —— SSE 连接直接关闭,用户 resume 时开新连接
+- `done` 是**最终信号**,前端收到后 close EventSource
+
+#### 5. `toMessageEvent` 转换函数
+
+```ts
+function toMessageEvent(ev: ChatStreamEvent): MessageEvent {
+  return { data: ev };
+}
+```
+
+简单到只有一个赋值,但它的作用是**类型适配**:
+- `ChatStreamEvent` 是业务类型(有 type discriminator)
+- `MessageEvent` 是 NestJS SSE 协议类型(data 字段)
+- NestJS 内部把 `data` 序列化为 `data: {"type":"text","content":"你好"}\n\n` 格式
+
+### SSE 线格式
+
+最终在 HTTP 响应体里看到的就是纯文本:
+
+```
+data: {"type":"text","content":"你"}
+
+data: {"type":"text","content":"好"}
+
+data: {"type":"chart","data":{"symbol":"300033.SZ","bars":[...]}}
+
+data: {"type":"done"}
+
+```
+
+每条消息以 `data: ` 开头,以两个 `\n\n` 结尾。浏览器 `EventSource` 自动解析。
+
+### HITL 时的两段式 SSE
+
+```
+第一段: stream 端点
+  data: {"type":"chart","data":{...}}     ← 图表数据
+  (连接关闭,不发 done)
+
+第二段: resume 端点(用户点确认后)
+  data: {"type":"text","content":"茅台近期偏多..."}
+  data: {"type":"done"}
+```
+
+前端用**同一个 `handleEventSource` 函数**处理两段,因为事件格式完全一致。区别只是 URL:
+- 第一段: `GET /api/chat/stream?sessionId=xxx&message=yyy`
+- 第二段: `GET /api/chat/resume?sessionId=xxx&action=confirm`
+
+### 代码位置速查
+
+| 层 | 文件 | 关键函数/类 |
+|---|---|---|
+| 前端 EventSource | `frontend/src/hooks/useChat.ts` | `send()` / `resume()` |
+| 前端事件处理 | `frontend/src/hooks/useChat.ts` | `handleEventSource()` |
+| 后端 @Sse 装饰器 | `backend/src/chat/chat.controller.ts` | `stream()` / `resume()` |
+| Observable 桥接 | `backend/src/chat/chat.controller.ts` | `new Observable(subscriber => { ... })` |
+| AsyncGenerator | `backend/src/chat/chat.service.ts` | `stream()` → orchestrator.stream() |
+| 事件类型 | `backend/src/chat/chat-stream.types.ts` | `ChatStreamEvent` |
+| Orchestrator | `backend/src/chat/langgraph-orchestrator.ts` | `async *stream(dto)` |
+
+### 常见坑
+
+1. **`EventSource` 只支持 GET** → 消息和 sessionId 放 query 参数,不是 body。长消息可能超过 URL 长度限制(2048 字符)。生产可以考虑用 `fetch` + `ReadableStream` 替代 EventSource。
+
+2. **Observable 的 teardown 是同步的** → `cancelled = true` 不会立即中断 `for await` 循环,要等下一个 yield 才检查。如果 LLM 调用卡住(30 秒),teardown 后仍然要等那 30 秒才 break。
+
+3. **`interrupt` 不发 `done`** → 前端收到 interrupt 后不能等 done,要主动关闭 EventSource。否则连接会挂起等待永远不会来的 done。
+
+4. **Content-Type 必须是 `text/event-stream`** → NestJS `@Sse` 自动设置。如果手动用 `@Get` + `res.write()`,需要自己设头,否则浏览器不认。
+
+5. **nginx 默认会 buffer SSE** → 需要加 `proxy_buffering off;` + `X-Accel-Buffering: no`。否则前端会一次性收到所有事件,失去流式效果。
 | Guardrails | 输入/输出安全防护 | 只在工具描述里写了诚信规则 |
 | LangGraph | 状态机式 agent 编排框架 | ❌ 没用,手写了循环 |

@@ -5,6 +5,10 @@ import { ChatStreamEvent } from './chat-stream.types';
 /** 共享接口 — ChatOrchestrator 和 LangGraphOrchestrator 都实现这个 */
 export interface ChatOrchestratorInterface {
   stream(dto: ChatMessageDto): AsyncGenerator<ChatStreamEvent>;
+  resume(
+    sessionId: string,
+    action: 'confirm' | 'cancel',
+  ): AsyncGenerator<ChatStreamEvent>;
 }
 
 export const CHAT_ORCHESTRATOR = Symbol('CHAT_ORCHESTRATOR');
@@ -26,5 +30,12 @@ export class ChatService {
 
   stream(dto: ChatMessageDto): AsyncGenerator<ChatStreamEvent> {
     return this.orchestrator.stream(dto);
+  }
+
+  resume(
+    sessionId: string,
+    action: 'confirm' | 'cancel',
+  ): AsyncGenerator<ChatStreamEvent> {
+    return this.orchestrator.resume(sessionId, action);
   }
 }

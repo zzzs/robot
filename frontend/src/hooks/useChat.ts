@@ -5,51 +5,19 @@ export type ChatBubble =
   | { kind: 'user'; content: string }
   | { kind: 'assistant-text'; content: string }
   | { kind: 'chart'; data: ChartPayload }
-  | { kind: 'tool-status'; status: 'no-data' | 'insufficient'; message: string };
+  | { kind: 'tool-status'; status: 'no-data' | 'insufficient'; message: string }
+  | { kind: 'confirm'; reason: string; confirmLabel: string; cancelLabel: string };
 
 export function useChat() {
   const [bubbles, setBubbles] = useState<ChatBubble[]>([]);
   const [streaming, setStreaming] = useState(false);
+  const [awaitingConfirm, setAwaitingConfirm] = useState(false);
   const [sessionId] = useState(() => crypto.randomUUID());
   const esRef = useRef<EventSource | null>(null);
 
-  const send = useCallback(
-    (text: string) => {
-      const trimmed = text.trim();
-      if (!trimmed || streaming) return;
-
-      setBubbles((prev) => [
-        ...prev,
-        { kind: 'user', content: trimmed },
-        { kind: 'assistant-text', content: '' },
-      ]);
-      setStreaming(true);
-
-      const url = `/api/chat/stream?sessionId=${encodeURIComponent(sessionId)}&message=${encodeURIComponent(trimmed)}`;
-      const es = new EventSource(url);
-      esRef.current = es;
-
-      const appendText = (delta: string) => {
-        setBubbles((prev) => {
-          const copy = [...prev];
-          for (let i = copy.length - 1; i >= 0; i--) {
-            const b = copy[i];
-            if (b.kind === 'assistant-text') {
-              copy[i] = { ...b, content: b.content + delta };
-              return copy;
-            }
-            // Stop climbing once we hit a non-assistant bubble.
-            if (b.kind === 'user' || b.kind === 'chart' || b.kind === 'tool-status') break;
-          }
-          return copy;
-        });
-      };
-
-      const pushBubble = (b: ChatBubble) => {
-        setBubbles((prev) => [...prev, b]);
-      };
-
-      es.onmessage = (ev) => {
+  const handleEventSource = useCallback(
+    (es: EventSource) => {
+      es.onmessage = (ev: MessageEvent) => {
         let payload: ChatStreamEvent;
         try {
           payload = JSON.parse(ev.data) as ChatStreamEvent;
@@ -58,28 +26,69 @@ export function useChat() {
         }
         switch (payload.type) {
           case 'text':
-            appendText(payload.content);
+            setBubbles((prev) => {
+              const copy = [...prev];
+              for (let i = copy.length - 1; i >= 0; i--) {
+                const b = copy[i];
+                if (b.kind === 'assistant-text') {
+                  copy[i] = { ...b, content: b.content + payload.content };
+                  return copy;
+                }
+                if (b.kind === 'user' || b.kind === 'chart' || b.kind === 'tool-status' || b.kind === 'confirm') break;
+              }
+              return copy;
+            });
             break;
           case 'chart':
-            pushBubble({ kind: 'chart', data: payload.data });
-            // Open a fresh assistant-text bubble for the summary that follows.
-            pushBubble({ kind: 'assistant-text', content: '' });
+            setBubbles((prev) => [
+              ...prev,
+              { kind: 'chart' as const, data: payload.data },
+              { kind: 'assistant-text' as const, content: '' },
+            ]);
             break;
           case 'analysis-summary':
-            appendText(payload.content);
+            setBubbles((prev) => {
+              const copy = [...prev];
+              for (let i = copy.length - 1; i >= 0; i--) {
+                const b = copy[i];
+                if (b.kind === 'assistant-text') {
+                  copy[i] = { ...b, content: b.content + payload.content };
+                  return copy;
+                }
+                if (b.kind === 'user' || b.kind === 'chart' || b.kind === 'tool-status' || b.kind === 'confirm') break;
+              }
+              return copy;
+            });
             break;
           case 'tool-status':
-            pushBubble({
-              kind: 'tool-status',
-              status: payload.status,
-              message: payload.message,
-            });
+            setBubbles((prev) => [
+              ...prev,
+              {
+                kind: 'tool-status' as const,
+                status: payload.status,
+                message: payload.message,
+              },
+            ]);
+            break;
+          case 'interrupt':
+            setBubbles((prev) => [
+              ...prev,
+              {
+                kind: 'confirm' as const,
+                reason: payload.reason,
+                confirmLabel: payload.confirmLabel,
+                cancelLabel: payload.cancelLabel,
+              },
+            ]);
+            setAwaitingConfirm(true);
+            es.close();
+            esRef.current = null;
+            setStreaming(false);
             break;
           case 'done':
             es.close();
             esRef.current = null;
             setStreaming(false);
-            // Trim a trailing empty assistant bubble (e.g., tool-status with no summary).
             setBubbles((prev) => {
               if (prev.length === 0) return prev;
               const last = prev[prev.length - 1];
@@ -98,7 +107,62 @@ export function useChat() {
         setStreaming(false);
       };
     },
-    [sessionId, streaming],
+    [],
+  );
+
+  const send = useCallback(
+    (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed || streaming || awaitingConfirm) return;
+
+      setBubbles((prev) => [
+        ...prev,
+        { kind: 'user' as const, content: trimmed },
+        { kind: 'assistant-text' as const, content: '' },
+      ]);
+      setStreaming(true);
+
+      const url = `/api/chat/stream?sessionId=${encodeURIComponent(sessionId)}&message=${encodeURIComponent(trimmed)}`;
+      const es = new EventSource(url);
+      esRef.current = es;
+      handleEventSource(es);
+    },
+    [sessionId, streaming, awaitingConfirm, handleEventSource],
+  );
+
+  const resume = useCallback(
+    (action: 'confirm' | 'cancel') => {
+      if (!awaitingConfirm) return;
+
+      setStreaming(true);
+      setAwaitingConfirm(false);
+
+      // Remove the confirm bubble (it's been acted on)
+      setBubbles((prev) => {
+        const last = prev[prev.length - 1];
+        if (last?.kind === 'confirm') {
+          return prev.slice(0, -1);
+        }
+        return prev;
+      });
+
+      if (action === 'cancel') {
+        setBubbles((prev) => [
+          ...prev,
+          { kind: 'assistant-text' as const, content: '已取消,未展示分析结果。' },
+        ]);
+        setStreaming(false);
+        return;
+      }
+
+      // confirm: open SSE to resume endpoint, add fresh assistant-text bubble
+      setBubbles((prev) => [...prev, { kind: 'assistant-text' as const, content: '' }]);
+      const url = `/api/chat/resume?sessionId=${encodeURIComponent(sessionId)}&action=confirm`;
+      const es = new EventSource(url);
+      esRef.current = es;
+      handleEventSource(es);
+    },
+    [sessionId, awaitingConfirm, handleEventSource],
   );
 
   useEffect(() => {
@@ -108,5 +172,5 @@ export function useChat() {
     };
   }, []);
 
-  return { bubbles, send, streaming, sessionId };
+  return { bubbles, send, streaming, sessionId, awaitingConfirm, resume };
 }

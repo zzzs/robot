@@ -75,6 +75,12 @@ export class ChatOrchestrator implements ChatOrchestratorInterface {
     private readonly sinaAnalysis: StockAnalysisService,
   ) {}
 
+  async *resume(): AsyncGenerator<ChatStreamEvent> {
+    await Promise.resolve();
+    yield { type: 'text', content: 'HITL 仅在 LangGraph 模式下可用。' };
+    yield { type: 'done' };
+  }
+
   async *stream(dto: ChatMessageDto): AsyncGenerator<ChatStreamEvent> {
     this.logger.log(
       `chat stream start sessionId=${dto.sessionId} msg=${dto.message.slice(0, 80)}`,

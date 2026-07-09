@@ -5,6 +5,12 @@ export type ChatStreamEvent =
   | { type: 'chart'; data: ChartPayload }
   | { type: 'analysis-summary'; content: string }
   | { type: 'tool-status'; status: 'no-data' | 'insufficient'; message: string }
+  | {
+      type: 'interrupt';
+      reason: string;
+      confirmLabel: string;
+      cancelLabel: string;
+    }
   | { type: 'done' };
 
 export type ChatEventMessageEvent = {

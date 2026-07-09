@@ -8,7 +8,15 @@ import {
   ToolMessage,
 } from '@langchain/core/messages';
 import { DynamicStructuredTool } from '@langchain/core/tools';
-import { Annotation, END, START, StateGraph } from '@langchain/langgraph';
+import {
+  Annotation,
+  END,
+  START,
+  StateGraph,
+  MemorySaver,
+  interrupt,
+  Command,
+} from '@langchain/langgraph';
 import { messagesStateReducer } from '@langchain/langgraph';
 import { ChatHistoryService, contentToString } from './chat-history.service';
 import { ChatMessageDto } from './dto/chat-message.dto';
@@ -56,10 +64,16 @@ const AgentState = Annotation.Root({
     reducer: messagesStateReducer,
     default: () => [],
   }),
-  // 副通道:tools 节点每次往里 push chart_payload,stream 监听者读到就发给前端
+  // 副通道:tools 节点返回本次请求的 chart_payload
+  // reducer 用 overwrite(不是 append)—— 每次新请求传 [] 清空旧 checkpoint 的图表
   emittedCharts: Annotation<ChartPayload[]>({
-    reducer: (prev, next) => [...prev, ...next],
+    reducer: (_, next) => next,
     default: () => [],
+  }),
+  // HITL:confirm 节点用这个字段标记用户是否确认了风险
+  confirmed: Annotation<boolean>({
+    reducer: (_, next) => next,
+    default: () => false,
   }),
 });
 
@@ -130,7 +144,17 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
       state: typeof AgentState.State,
       config: import('@langchain/core/runnables').RunnableConfig,
     ): Promise<Partial<typeof AgentState.State>> => {
-      const response = await bound.invoke(state.messages, {
+      // MemorySaver checkpoint + historySvc 双重存储会导致 SystemMessage 重复
+      // Anthropic API 只允许一个 SystemMessage 且必须在第一位 → 去重
+      let seenSystem = false;
+      const messages = state.messages.filter((m) => {
+        if (m instanceof SystemMessage) {
+          if (seenSystem) return false;
+          seenSystem = true;
+        }
+        return true;
+      });
+      const response = await bound.invoke(messages, {
         ...config,
         runName: 'stock-agent (langgraph)',
         tags: [...(config.tags ?? []), 'langgraph', 'stock-agent'],
@@ -263,14 +287,41 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
       return route;
     };
 
-    // 6️⃣ 拼装 graph
+    // 6️⃣ HITL confirm 节点:tools 之后、agent 之前
+    //    只有 emittedCharts 非空(调了 analyze_stock)才 interrupt
+
+    // confirmNode: sync function (interrupt() throws to pause, no await needed)
+    const confirmNode = (
+      state: typeof AgentState.State,
+    ): Partial<typeof AgentState.State> => {
+      if (!state.emittedCharts || state.emittedCharts.length === 0) {
+        return {};
+      }
+      const interruptResult: unknown = interrupt({
+        reason: '⚠️ 技术分析仅供参考,不构成投资建议。投资有风险,请独立决策。',
+        confirmLabel: '我了解风险,继续',
+        cancelLabel: '取消',
+      });
+      return { confirmed: interruptResult === 'confirmed' };
+    };
+
+    // 7️⃣ confirm 后的路由:confirmed → agent;cancelled → END
+    const routeAfterConfirm = (state: typeof AgentState.State) => {
+      if (state.confirmed === false) return END;
+      return 'agent';
+    };
+
+    // 8️⃣ 拼装 graph + MemorySaver checkpointer
+    const checkpointer = new MemorySaver();
     this.compiled = new StateGraph(AgentState)
       .addNode('agent', callModel)
       .addNode('tools', executeTools)
+      .addNode('confirm', confirmNode)
       .addEdge(START, 'agent')
       .addConditionalEdges('agent', routeAfterAgent)
-      .addEdge('tools', 'agent')
-      .compile();
+      .addEdge('tools', 'confirm')
+      .addConditionalEdges('confirm', routeAfterConfirm)
+      .compile({ checkpointer });
   }
 
   async *stream(dto: ChatMessageDto): AsyncGenerator<ChatStreamEvent> {
@@ -305,10 +356,10 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
     //    - 'messages': 模型产 token 时触发(用来流式 text 给前端)
     //    多 stream mode 时每个 chunk 是元组 [mode, payload]
     const stream = await this.compiled.stream(
-      { messages: initialMessages },
+      { messages: initialMessages, emittedCharts: [], confirmed: false },
       {
         recursionLimit: MAX_ITER,
-        configurable: {},
+        configurable: { thread_id: dto.sessionId },
         streamMode: ['values', 'updates', 'messages'],
       },
     );
@@ -370,9 +421,131 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
       `stream done. modeCounts=${JSON.stringify(modeCounts)} finalText_len=${finalText.length} charts=${chartsSent}`,
     );
 
+    // HITL:检查 graph 是否被 interrupt 暂停
+    const stateAfter = await this.compiled.getState({
+      configurable: { thread_id: dto.sessionId },
+    });
+    if (stateAfter && stateAfter.next.length > 0) {
+      // Graph 被暂停(confirm 节点的 interrupt)
+      // 从 state 中提取 interrupt 信息
+      const tasks = stateAfter.tasks;
+      const interruptInfo = tasks
+        ?.map((t) => t.interrupts)
+        ?.flat()
+        ?.find((i) => i !== undefined);
+      const reason =
+        (interruptInfo?.value as { reason?: string })?.reason ??
+        '请确认是否继续';
+      const confirmLabel =
+        (interruptInfo?.value as { confirmLabel?: string })?.confirmLabel ??
+        '确认';
+      const cancelLabel =
+        (interruptInfo?.value as { cancelLabel?: string })?.cancelLabel ??
+        '取消';
+      this.logger.log(
+        `graph interrupted at ${stateAfter.next.join(',')} — waiting for user confirmation`,
+      );
+      yield { type: 'interrupt', reason, confirmLabel, cancelLabel };
+      return; // 不 yield done,等用户 resume
+    }
+
+    // 用户取消(confirmed=false):写一条取消消息
+    if (
+      (stateAfter?.values as { confirmed?: boolean } | undefined)?.confirmed ===
+        false &&
+      stateAfter.next.length === 0
+    ) {
+      finalText = '已取消,未展示分析结果。';
+      yield { type: 'text', content: finalText };
+    }
+
     // 保存最终回答到历史
     if (finalText) {
       await this.historySvc.get(dto.sessionId).addAIMessage(finalText);
+    }
+    yield { type: 'done' };
+  }
+
+  /**
+   * HITL 恢复:用户确认或取消后,从 interrupt 处继续执行 graph。
+   * 用 LangGraph 的 Command({ resume: value }) 机制注入用户响应。
+   */
+  async *resume(
+    sessionId: string,
+    action: 'confirm' | 'cancel',
+  ): AsyncGenerator<ChatStreamEvent> {
+    const config = { configurable: { thread_id: sessionId } };
+
+    // 检查是否有 pending interrupt
+    const stateBefore = await this.compiled.getState(config);
+    if (!stateBefore || stateBefore.next.length === 0) {
+      yield {
+        type: 'text',
+        content: '没有待确认的操作。',
+      };
+      yield { type: 'done' };
+      return;
+    }
+
+    this.logger.log(
+      `resume session=${sessionId} action=${action} from node=${stateBefore.next.join(',')}`,
+    );
+
+    const resumeValue = action === 'confirm' ? 'confirmed' : 'cancelled';
+    const stream = await this.compiled.stream(
+      new Command({ resume: resumeValue }),
+      {
+        ...config,
+        recursionLimit: MAX_ITER,
+        streamMode: ['values', 'updates', 'messages'],
+      },
+    );
+
+    let chartsSent = 0;
+    let finalText = '';
+
+    for await (const chunk of stream) {
+      const [mode, payload] = chunk as unknown as [string, unknown];
+
+      if (mode === 'values') {
+        const state = payload as typeof AgentState.State;
+        if (state.emittedCharts) {
+          while (chartsSent < state.emittedCharts.length) {
+            yield { type: 'chart', data: state.emittedCharts[chartsSent] };
+            chartsSent++;
+          }
+        }
+      } else if (mode === 'updates') {
+        const updates = payload as Record<
+          string,
+          Partial<typeof AgentState.State>
+        >;
+        for (const [nodeName] of Object.entries(updates)) {
+          this.logger.log(`resume: node=${nodeName} completed`);
+        }
+      } else if (mode === 'messages') {
+        const [chunkMsg, meta] = payload as [
+          { content?: unknown },
+          { langgraph_node?: string },
+        ];
+        const node = meta?.langgraph_node ?? '';
+        if (node !== 'agent') continue;
+        const text = contentToString(chunkMsg.content);
+        if (text) {
+          finalText += text;
+          yield { type: 'text', content: text };
+        }
+      }
+    }
+
+    // 用户取消时写一条提示
+    if (action === 'cancel' && !finalText) {
+      finalText = '已取消,未展示分析结果。';
+      yield { type: 'text', content: finalText };
+    }
+
+    if (finalText) {
+      await this.historySvc.get(sessionId).addAIMessage(finalText);
     }
     yield { type: 'done' };
   }

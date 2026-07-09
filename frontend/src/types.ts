@@ -81,4 +81,10 @@ export type ChatStreamEvent =
       status: 'no-data' | 'insufficient';
       message: string;
     }
+  | {
+      type: 'interrupt';
+      reason: string;
+      confirmLabel: string;
+      cancelLabel: string;
+    }
   | { type: 'done' };

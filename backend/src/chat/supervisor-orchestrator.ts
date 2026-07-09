@@ -305,6 +305,12 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
       .compile();
   }
 
+  async *resume(): AsyncGenerator<ChatStreamEvent> {
+    await Promise.resolve();
+    yield { type: 'text', content: 'HITL 仅在 LangGraph 模式下可用。' };
+    yield { type: 'done' };
+  }
+
   async *stream(dto: ChatMessageDto): AsyncGenerator<ChatStreamEvent> {
     this.logger.log(
       `supervisor stream start sessionId=${dto.sessionId} msg=${dto.message.slice(0, 80)}`,

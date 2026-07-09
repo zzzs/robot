@@ -4,7 +4,8 @@ import { StockChart } from './components/StockChart';
 import './App.css';
 
 function App() {
-  const { bubbles, send, streaming, sessionId } = useChat();
+  const { bubbles, send, streaming, sessionId, awaitingConfirm, resume } =
+    useChat();
   const [input, setInput] = useState('');
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -27,6 +28,8 @@ function App() {
     }
   };
 
+  const isLocked = streaming || awaitingConfirm;
+
   return (
     <div className="app">
       <header className="app-header">
@@ -36,7 +39,9 @@ function App() {
 
       <div className="messages" ref={listRef}>
         {bubbles.length === 0 && (
-          <div className="empty">说点什么开始对话吧 (Enter 发送, Shift+Enter 换行)</div>
+          <div className="empty">
+            说点什么开始对话吧 (Enter 发送, Shift+Enter 换行)
+          </div>
         )}
         {bubbles.map((b, i) => {
           if (b.kind === 'user') {
@@ -65,6 +70,32 @@ function App() {
               </div>
             );
           }
+          if (b.kind === 'confirm') {
+            return (
+              <div key={i} className="bubble assistant confirm-bubble">
+                <span className="role">⚠️ 风险确认</span>
+                <div className="content confirm-content">
+                  <p className="confirm-reason">{b.reason}</p>
+                  <div className="confirm-buttons">
+                    <button
+                      className="confirm-btn"
+                      onClick={() => resume('confirm')}
+                      disabled={!awaitingConfirm}
+                    >
+                      {b.confirmLabel}
+                    </button>
+                    <button
+                      className="cancel-btn"
+                      onClick={() => resume('cancel')}
+                      disabled={!awaitingConfirm}
+                    >
+                      {b.cancelLabel}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          }
           // assistant-text
           return (
             <div key={i} className="bubble assistant">
@@ -82,11 +113,17 @@ function App() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder={streaming ? 'AI 回答中…' : '输入消息 (试试 "分析一下 600519.SH")'}
-          disabled={streaming}
+          placeholder={
+            awaitingConfirm
+              ? '请先确认或取消上方提示…'
+              : streaming
+                ? 'AI 回答中…'
+                : '输入消息 (试试 "分析一下 600519.SH")'
+          }
+          disabled={isLocked}
           rows={2}
         />
-        <button onClick={submit} disabled={streaming || !input.trim()}>
+        <button onClick={submit} disabled={isLocked || !input.trim()}>
           发送
         </button>
       </div>
