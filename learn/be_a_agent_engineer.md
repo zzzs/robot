@@ -17,6 +17,7 @@
 | [`rag_debugging_journey.md`](rag_debugging_journey.md) | RAG 调通全历程(问题 + 解决) | 遇到 RAG 问题时看 |
 | [`eval_framework.md`](eval_framework.md) | Eval dataset + LLM-as-judge 详解 | 想做自动化评估时看 |
 | [`hitl_confirmation.md`](hitl_confirmation.md) | MemorySaver + interrupt + HITL 详解 | 想加"暂停等确认"功能时看 |
+| [`create_agent.md`](create_agent.md) | createAgent vs 手写 StateGraph 对比 | 想知道何时用 prebuilt、何时手写时看 |
 
 ---
 
@@ -77,6 +78,7 @@ ChatOrchestrator.stream()                ← 手写的 Agent 主循环
 | `DynamicStructuredTool` + Zod schema | 工具的入参契约 + 自动校验 |
 | `BaseMessage` 体系(SystemMessage / HumanMessage / AIMessage / ToolMessage) | 多轮对话的消息类型 |
 | `InMemoryChatMessageHistory` | 短期记忆(按 sessionId 隔离) |
+| `createAgent` (langchain 包 v1.5+) | prebuilt ReAct agent,取代 `@langchain/langgraph/prebuilt` 的 `createReactAgent` — `chat/create-agent-orchestrator.ts` |
 
 ### Model Context Protocol (MCP)
 

@@ -8,6 +8,7 @@ import { chatModelProvider } from './providers/chat-chain.provider';
 import { ChatOrchestrator } from './chat.orchestrator';
 import { LangGraphOrchestrator } from './langgraph-orchestrator';
 import { SupervisorOrchestrator } from './supervisor-orchestrator';
+import { CreateAgentOrchestrator } from './create-agent-orchestrator';
 import { StockModule } from '../stock/stock.module';
 import { NewsRagModule } from '../news/news-rag.module';
 
@@ -20,28 +21,33 @@ import { NewsRagModule } from '../news/news-rag.module';
     ChatOrchestrator,
     LangGraphOrchestrator,
     SupervisorOrchestrator,
+    CreateAgentOrchestrator,
     chatModelProvider,
     {
       // 根据 ORCHESTRATOR env 选择实现:
-      //   'langgraph' → LangGraph 状态机版本
-      //   'supervisor' → 多 agent (supervisor + researcher + summarizer)
-      //   其他       → 手写 ChatOrchestrator
+      //   'langgraph'     → LangGraph 状态机版本
+      //   'supervisor'     → 多 agent (supervisor + researcher + summarizer)
+      //   'create-agent'   → langchain 包 createAgent prebuilt 版 (学习对比用)
+      //   其他           → 手写 ChatOrchestrator
       provide: CHAT_ORCHESTRATOR,
       inject: [
         ChatOrchestrator,
         LangGraphOrchestrator,
         SupervisorOrchestrator,
+        CreateAgentOrchestrator,
         ConfigService,
       ],
       useFactory: (
         manual: ChatOrchestrator,
         langgraph: LangGraphOrchestrator,
         supervisor: SupervisorOrchestrator,
+        createAgent: CreateAgentOrchestrator,
         config: ConfigService,
       ) => {
         const choice = config.get<string>('orchestrator') ?? 'manual';
         if (choice === 'langgraph') return langgraph;
         if (choice === 'supervisor') return supervisor;
+        if (choice === 'create-agent') return createAgent;
         return manual;
       },
     },
