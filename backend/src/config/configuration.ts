@@ -32,6 +32,14 @@ export default () => ({
   // 'langgraph' = LangGraph 状态机版本(学习用),
   // 'supervisor' = supervisor + researcher + summarizer 多 agent 版本(学习用)
   orchestrator: (process.env.ORCHESTRATOR ?? 'manual').toLowerCase(),
+  // Summary Memory(长会话压缩)配置 —— 当对话消息数 >= threshold 时,
+  // 把更早的消息压成一段 summary,保留 recentKeep 条最近的原文。
+  // 见 backend/src/chat/summary-memory.service.ts
+  summary: {
+    enabled: process.env.SUMMARY_ENABLED !== 'false', // 默认 true
+    threshold: Number.parseInt(process.env.SUMMARY_THRESHOLD ?? '20', 10),
+    recentKeep: Number.parseInt(process.env.SUMMARY_RECENT_KEEP ?? '6', 10),
+  },
   // News RAG 配置 —— 默认走内置 fixture(20 篇 A 股示例新闻,离线可用),
   // 网络条件允许时改 NEWS_RSS_URLS 换真源(详见 .env.example)
   news: {

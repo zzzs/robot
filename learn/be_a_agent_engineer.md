@@ -23,7 +23,20 @@
 
 ## 一、现有架构解析
 
-### 数据流(单次股票分析)
+### 4 个 Orchestrator 可切换
+
+项目有 4 套 orchestrator 实现,通过 `ORCHESTRATOR` env 切换:
+
+| env 值 | 实现 | 定位 |
+|---|---|---|
+| `manual` (默认) | `ChatOrchestrator` (`chat.orchestrator.ts`) | 手写 ReAct 循环,教学基线 |
+| `langgraph` | `LangGraphOrchestrator` (`langgraph-orchestrator.ts`) | 手写 StateGraph,生产推荐 |
+| `supervisor` | `SupervisorOrchestrator` (`supervisor-orchestrator.ts`) | supervisor + researcher + summarizer 多 agent |
+| `create-agent` | `CreateAgentOrchestrator` (`create-agent-orchestrator.ts`) | langchain 包 prebuilt `createAgent`,学习对比用 |
+
+4 个都实现同一个 `ChatOrchestratorInterface` (`stream` + `resume`),通过 NestJS 工厂 provider 注入到 `ChatService`。详见 `chat.module.ts`。
+
+### 数据流(单次股票分析,以 langgraph 为例)
 
 ```
 浏览器 (App.tsx)
@@ -31,31 +44,40 @@
   ↓
 ChatController (@Sse)                    ← NestJS
   ↓
-ChatOrchestrator.stream()                ← 手写的 Agent 主循环
+ChatService.stream() → AsyncGenerator    ← chat.service.ts
+  ↓
+Orchestrator.stream() (4 选 1)           ← langgraph-orchestrator.ts
   │
-  ├─ 1. 拼 messages: SystemMessage + history + HumanMessage
-  ├─ 2. model.bindTools([freeTool, tushareTool]).stream(messages)
-  │      ↓ 流式接收 AIMessageChunk
-  │      ↓ ToolCallAggregator 把 tool_call_chunks 拼成完整 ToolCall
+  ├─ 1. 拼 messages: SummaryMemoryService.mergeSummaryIntoPrompt(SYSTEM_PROMPT, history)
+  │      + HumanMessage (长会话时 history 头部带 summary,合并进 prompt 避免双 SystemMessage)
   │
-  ├─ 3. 如果有 tool_call:
+  ├─ 2. compiled graph.stream(messages, { configurable: { thread_id }, streamMode: ['values','updates','messages'] })
+  │      ↓ 'agent' 节点调 bound.invoke → AIMessage(tool_calls)
+  │      ↓ 'tools' 节点分发到 analyze_stock_free / analyze_stock / search_news
+  │
+  ├─ 3. 工具执行:
   │      ├─ analyze_stock_free → SinaClient.getDaily (HTTP fetch 新浪)
   │      ├─ analyze_stock     → McpStockClient.getDaily (子进程 stdio)
   │      │   ↳ 失败时 transparent fallback 到 Sina
   │      ├─ 跑 IndicatorService(MA/MACD/RSI/BOLL/KDJ)
   │      ├─ SignalDeriver → TrendScorer → 综合判断
-  │      ├─ yield { type:'chart', data }    ← 副通道:图表数据直发前端
-  │      └─ 把 trimmed observation 塞回 ToolMessage,loop 再次调模型
+  │      ├─ chart_payload 写入 state.emittedCharts 副通道 (state reducer 追加)
+  │      └─ 把 trimmed observation 塞回 ToolMessage,conditional edge 路由回 agent
   │
-  └─ 4. 模型最终没再调工具 → 写总结 → addAIMessage(history) → yield done
+  ├─ 4. 'confirm' 节点检测 emittedCharts 非空 → interrupt() 暂停等用户确认
+  │      (create-agent 模式不同:interrupt 嵌在工具 func 内,见 learn/create_agent.md)
+  │
+  └─ 5. 模型最终没再调工具 → 写总结 → addAIMessage(history) → yield done
 ```
 
 ### 各模块职责
 
 | 模块 | 职责 | 关键文件 |
 |---|---|---|
-| `ChatOrchestrator` | Agent 主循环(自己实现的 ReAct 变体) | `chat/chat.orchestrator.ts` |
+| `ChatOrchestrator` / `LangGraphOrchestrator` / `SupervisorOrchestrator` / `CreateAgentOrchestrator` | 4 套 orchestrator 实现 | `chat/*.orchestrator.ts` |
+| `ChatService` | orchestrator 工厂 + 共享接口 | `chat/chat.service.ts` |
 | `ChatHistoryService` | 会话历史(In-memory,按 sessionId 隔离) | `chat/chat-history.service.ts` |
+| `SummaryMemoryService` | 长会话压缩,在 ChatHistoryService.getMessages 透明拦截 | `chat/summary-memory.service.ts` |
 | `StockAnalysisService` | 数据源无关的分析编排(可注入 Mcp 或 Sina) | `stock/stock-analysis.service.ts` |
 | `IndicatorService` | 纯函数指标计算 | `stock/indicators/indicator.service.ts` |
 | `SignalDeriver` / `TrendScorer` | 离散信号 + 综合评分 | `stock/analysis/*.ts` |
@@ -123,6 +145,64 @@ ChatOrchestrator.stream()                ← 手写的 Agent 主循环
 ---
 
 
+## 三·五、Memory 管理(对话上下文压缩)
+
+> 长会话不爆窗口的关键设施。见 `backend/src/chat/summary-memory.service.ts`。
+
+### 触发条件
+
+- 消息条数 >= `SUMMARY_THRESHOLD`(默认 20)→ 触发压缩
+- 最近 `SUMMARY_RECENT_KEEP`(默认 6)条原封不动,只压更早的
+- 不用 token 估算,稳定可预测
+
+### 压缩流程
+
+```
+ChatHistoryService.getMessages(sessionId)
+  ↓
+  raw = InMemoryChatMessageHistory.getMessages()    # 全量历史
+  ↓
+  SummaryMemoryService.wrap(sessionId, raw)
+  ├─ length < threshold → 原样返回 raw
+  └─ length >= threshold
+     ├─ 缓存 hit (same length) → 复用上次 summary
+     └─ 缓存 miss
+        ├─ summarizeOrCached → 走 LLM
+        │   - 并发去重:Map<sessionId, Promise>
+        │   - LLM 失败 → 降级返回 raw
+        ├─ messagesToSummaryText(messages):
+        │   - HumanMessage → "用户: ..."
+        │   - AIMessage → "助手: ..." + tool_calls 列表
+        │   - ToolMessage → "[工具结果(name): status=...]"
+        │     ⚠️ ToolMessage 原始 content 永不进 LLM(诚信保护)
+        │   - SystemMessage(__summary) → "(历史 summary): ..."
+        └─ 返回 [SystemMessage(summary, __summary=true), ...recentK]
+```
+
+### Orchestrator 集成 (mergeSummaryIntoPrompt)
+
+Anthropic API 只允许 1 条 SystemMessage。如果 history 头上是 summary SystemMessage、orchestrator 又要 prepend 真实 prompt,会触发 API 错误。`SummaryMemoryService.mergeSummaryIntoPrompt(realPrompt, history)` helper 把 summary 合并进 prompt 字符串,返回 `{ prompt, messages }` 让 orchestrator 拼。
+
+```ts
+// 4 个 orchestrator (manual / langgraph / supervisor) 都这样用:
+const history = await this.historySvc.getMessages(sessionId);
+const { prompt, messages } = SummaryMemoryService.mergeSummaryIntoPrompt(SYSTEM_PROMPT, history);
+const initial = [new SystemMessage(prompt), ...messages, human];
+```
+
+create-agent 模式特殊:它用 `createAgent({ systemPrompt })` 静态字段,所以 summary 被转成 HumanMessage 包装成 `[历史对话摘要] ...` 块放在 history 之前。
+
+### 何时切换到 VectorStoreRetrieverMemory
+
+SummaryMemory 解决"窗口爆掉"问题,**不解决"跨 session 记忆"** 问题。如果要让 agent 记住"用户偏好大盘股"、"上次推荐过哪些票"这类长期事实,需要:
+- 抽取实体 → EntityMemory / `InMemoryStore`
+- 或语义检索过去对话 → `VectorStoreRetrieverMemory`
+
+这是下一步 ⭐ 工作。
+
+---
+
+
 ## 四、SSE 流式响应实现详解
 
 > "后端怎么把 agent 的逐 token 输出推到前端" 是 agent 开发的核心基础设施。
@@ -146,7 +226,7 @@ ChatService.stream() → AsyncGenerator<ChatStreamEvent>
     ↓  yield { type: 'chart', data: {...} }
     ↓  yield { type: 'done' }
     ↓
-Orchestrator (LangGraph/Manual/Supervisor)
+Orchestrator (LangGraph / Manual / Supervisor / CreateAgent)
     ↓  graph.stream() 或 bound.stream()
     ↓
 LLM + Tools
@@ -332,7 +412,7 @@ data: {"type":"done"}
 | Observable 桥接 | `backend/src/chat/chat.controller.ts` | `new Observable(subscriber => { ... })` |
 | AsyncGenerator | `backend/src/chat/chat.service.ts` | `stream()` → orchestrator.stream() |
 | 事件类型 | `backend/src/chat/chat-stream.types.ts` | `ChatStreamEvent` |
-| Orchestrator | `backend/src/chat/langgraph-orchestrator.ts` | `async *stream(dto)` |
+| Orchestrator (4 选 1) | `backend/src/chat/{chat,langgraph,supervisor,create-agent}-orchestrator.ts` | `async *stream(dto)` |
 
 ### 常见坑
 
@@ -345,5 +425,3 @@ data: {"type":"done"}
 4. **Content-Type 必须是 `text/event-stream`** → NestJS `@Sse` 自动设置。如果手动用 `@Get` + `res.write()`,需要自己设头,否则浏览器不认。
 
 5. **nginx 默认会 buffer SSE** → 需要加 `proxy_buffering off;` + `X-Accel-Buffering: no`。否则前端会一次性收到所有事件,失去流式效果。
-| Guardrails | 输入/输出安全防护 | 只在工具描述里写了诚信规则 |
-| LangGraph | 状态机式 agent 编排框架 | ❌ 没用,手写了循环 |

@@ -10,6 +10,7 @@ import {
 } from '@langchain/core/messages';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { ChatHistoryService, contentToString } from './chat-history.service';
+import { SummaryMemoryService } from './summary-memory.service';
 import { ChatMessageDto } from './dto/chat-message.dto';
 import { ChatStreamEvent } from './chat-stream.types';
 import { CHAT_MODEL } from './chat.constants';
@@ -86,13 +87,18 @@ export class ChatOrchestrator implements ChatOrchestratorInterface {
       `chat stream start sessionId=${dto.sessionId} msg=${dto.message.slice(0, 80)}`,
     );
     const sessionHistory = this.historySvc.get(dto.sessionId);
-    const history = await sessionHistory.getMessages();
+    const history = await this.historySvc.getMessages(dto.sessionId);
     const human = new HumanMessage(dto.message);
     await sessionHistory.addMessage(human);
 
+    // 把 history 头上的 summary SystemMessage (如果有) 合并进真实 prompt
+    // 避免出现 2 条 SystemMessage 触发 Anthropic API 错误
+    const { prompt, messages: historyWithoutSummary } =
+      SummaryMemoryService.mergeSummaryIntoPrompt(SYSTEM_PROMPT, history);
+
     const messages: BaseMessage[] = [
-      new SystemMessage(SYSTEM_PROMPT),
-      ...history,
+      new SystemMessage(prompt),
+      ...historyWithoutSummary,
       human,
     ];
 

@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { ChatController } from './chat.controller';
 import { ChatService, CHAT_ORCHESTRATOR } from './chat.service';
 import { ChatHistoryService } from './chat-history.service';
+import { SummaryMemoryService } from './summary-memory.service';
 import { CHAT_MODEL } from './chat.constants';
 import { chatModelProvider } from './providers/chat-chain.provider';
 import { ChatOrchestrator } from './chat.orchestrator';
@@ -17,6 +18,7 @@ import { NewsRagModule } from '../news/news-rag.module';
   controllers: [ChatController],
   providers: [
     ChatService,
+    SummaryMemoryService,
     ChatHistoryService,
     ChatOrchestrator,
     LangGraphOrchestrator,

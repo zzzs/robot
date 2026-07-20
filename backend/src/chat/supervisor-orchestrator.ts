@@ -11,6 +11,7 @@ import { DynamicStructuredTool } from '@langchain/core/tools';
 import { Annotation, END, START, StateGraph } from '@langchain/langgraph';
 import { messagesStateReducer } from '@langchain/langgraph';
 import { ChatHistoryService, contentToString } from './chat-history.service';
+import { SummaryMemoryService } from './summary-memory.service';
 import { ChatMessageDto } from './dto/chat-message.dto';
 import { ChatStreamEvent } from './chat-stream.types';
 import { CHAT_MODEL } from './chat.constants';
@@ -317,13 +318,20 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
     );
 
     const sessionHistory = this.historySvc.get(dto.sessionId);
-    const history = await sessionHistory.getMessages();
+    const history = await this.historySvc.getMessages(dto.sessionId);
     const human = new HumanMessage(dto.message);
     await sessionHistory.addMessage(human);
 
+    // 合并 history 头上的 summary (如果有) 到 supervisor 标记 prompt
+    const { prompt, messages: historyWithoutSummary } =
+      SummaryMemoryService.mergeSummaryIntoPrompt(
+        'stock-agent (supervisor mode)',
+        history,
+      );
+
     const initialMessages: BaseMessage[] = [
-      new SystemMessage('stock-agent (supervisor mode)'),
-      ...history,
+      new SystemMessage(prompt),
+      ...historyWithoutSummary,
       human,
     ];
 

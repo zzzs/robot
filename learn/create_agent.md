@@ -44,12 +44,13 @@ const graph = new StateGraph(AgentState)
 import { createAgent } from 'langchain'; // 注意:不是 @langchain/langgraph/prebuilt
 
 const agent = createAgent({
-  llm: model,
+  model: model,                       // 字段名是 'model',不是 'llm'
   tools: [wrappedFreeTool, wrappedTushareTool, searchNewsTool],
+  systemPrompt: SYSTEM_PROMPT,        // 字段注入,不放进 messages
   checkpointer: new MemorySaver(),
 });
-// 内部自动构造:model node + ToolNode + 条件路由 + 默认 prompt
-// 节点名:'agent' (LLM 调用) 和 'tools' (工具执行)
+// 内部自动构造:model_request 节点 (LLM 调用) + ToolNode + toolsCondition 条件路由
+// 节点名:'model_request' (LLM) 和 'tools' (工具执行) —— 不是 'agent'!
 ```
 
 `createAgent` 帮你省掉了:
@@ -90,25 +91,34 @@ const agent = createAgent({
 
 **本次方案**:
 - 包装 `analyze_stock_free` 工具,在 `func` 里直接调 `service.analyze()` (绕过原 tool 的去 chart 逻辑)
-- 把 `chart_payload` 推入 `AsyncLocalStorage<ChartPayload[]>` 缓冲(per-request 隔离)
-- stream() 在 ALS 上下文里跑 `agent.stream(...)`,结束后从缓冲取 chart emit 为 SSE
+- 把 `chart_payload` 推入 per-session `Map<string, ChartPayload[]>` (key = thread_id)
+- stream() 入口登记 buffer,finally 块清理;tool func 通过 config 拿到 thread_id 查 Map
 
 ```ts
-const chartAls = new AsyncLocalStorage<ChartPayload[]>();
+// orchestrator class field
+private readonly chartBuffers = new Map<string, ChartPayload[]>();
 
-// 包装工具的 func
-async func({ ts_code, range }) {
+// 包装工具的 func (config 是第 3 位置参数)
+async func({ ts_code, range }, _runManager, config) {
+  const threadId = config?.configurable?.thread_id;
   const result = await service.analyze({ ts_code, range });
-  chartAls.getStore()?.push(result.chart_payload);
+  const buffer = threadId ? this.chartBuffers.get(threadId) : undefined;
+  buffer?.push(result.chart_payload);
   // ... interrupt() if chart ...
   return JSON.stringify(trimmedSummary(result));
 }
 
 // stream()
-await chartAls.run(chartBuffer, async () => {
+const chartBuffer: ChartPayload[] = [];
+this.chartBuffers.set(dto.sessionId, chartBuffer);
+try {
   for await (const chunk of agent.stream(...)) { ... }
-});
+} finally {
+  this.chartBuffers.delete(dto.sessionId);
+}
 ```
+
+> **设计历程**:最初尝试用 `AsyncLocalStorage<ChartPayload[]>`,但 `AsyncLocalStorage.run()` 的 callback 是 async 函数不是 async generator,无法在里面 `yield` SSE 事件。改用 per-session Map 更简单,也匹配手写 langgraph orchestrator 用 `state.emittedCharts` 的思路。
 
 **代价**:工具承担了"副作用 + chart 提取"职责,违反"工具函数应该纯"的惯例。但这是 createAgent API 边界带来的妥协。
 
@@ -125,9 +135,10 @@ await chartAls.run(chartBuffer, async () => {
 **本次方案 (C)**:在包装工具的 `func` 里,如果 `chart_payload` 非空,就调 `interrupt()`。这是函数式 interrupt API 的正确用法 —— `interrupt()` 会在调用的位置暂停 graph,`Command({ resume })` 后从此处继续。
 
 ```ts
-async func({ ts_code, range }) {
+async func({ ts_code, range }, _runManager, config) {
+  const threadId = config?.configurable?.thread_id;
   const result = await service.analyze(...);
-  chartAls.getStore()?.push(result.chart_payload);
+  this.chartBuffers.get(threadId)?.push(result.chart_payload);
 
   if (result.chart_payload) {
     const userAction = interrupt({ reason: '...', confirmLabel: '...', cancelLabel: '...' });
@@ -148,6 +159,8 @@ async func({ ts_code, range }) {
 - 工具承担 HITL 关注点(职责扩散)
 - interrupt 在 tool func 内部,trace 里看会有点奇怪(中断发生在工具调用 trace 内部)
 - 工具结果(返回给 LLM 的 observation)依赖 resume 值,有耦合
+
+**关键 gotcha —— LangGraph resume 会重新执行整个 tool node**:`Command({ resume })` 后,工具 func 从头开始 re-execute,而不是从中断点继续。这意味着 `service.analyze()` 会**再调一次**(浪费一次 Sina HTTP + 指标计算)。本项目用 `analysisCache: Map<threadId+tsCode+range, AnalysisResult>` 缓存第一次的结果,resume 时直接命中。详见 `create-agent-orchestrator.ts:runAnalysisWithFallback` + `analysisCache` 字段。
 
 ### 3. AIMessageChunk → AIMessage 转换
 
@@ -211,10 +224,10 @@ robot 项目的股票分析场景有:
 
 | 维度 | 局限 | 影响 |
 |---|---|---|
-| chart 副通道 | 用 AsyncLocalStorage + 工具闭包,而不是 state 副通道 | trace 里看不到 chart_payload,debug 困难 |
+| chart 副通道 | 用 per-session Map + 工具内闭包,而不是 state 副通道 | trace 里看不到 chart_payload,debug 困难;并发需 Map 隔离 |
 | HITL | interrupt() 嵌在工具 func 内,不在独立 confirm 节点 | LangSmith trace 里 interrupt 发生在工具调用内部,不直观 |
 | 测试 | 未写 e2e 测试 | 手动验证(见 tasks.md 6.1-6.6) |
-| 并发 | ALS 保证 per-request 隔离,但同一 session 并发 stream 仍会冲突(MemorySaver 单 thread) | 限制:同 sessionId 不能并发(与 langgraph 编排器一致) |
+| 并发 | per-session Map 保证不同 session 隔离,但同一 session 并发 stream 仍会冲突(MemorySaver 单 thread) | 限制:同 sessionId 不能并发(与 langgraph 编排器一致) |
 
 ---
 

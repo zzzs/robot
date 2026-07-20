@@ -250,6 +250,8 @@ for await (const [mode, payload] of stream) {
 ## 五、用官方 `createAgent` 缩到 5 行
 
 > ⚠️ **API 变更(2026):** `createReactAgent` 已从 `@langchain/langgraph/prebuilt` **弃用**,已迁移到 `langchain` 包并重命名为 `createAgent`。旧导入仍可用但会有 deprecation warning。
+>
+> 本项目已用 `createAgent` 实现了 `CreateAgentOrchestrator` (`backend/src/chat/create-agent-orchestrator.ts`),切换 `ORCHESTRATOR=create-agent` 即可。详见 `learn/create_agent.md` —— 那里对比了 prebuilt 与手写 StateGraph 的边界(chart 副通道、HITL、AIMessageChunk 转换等)。
 
 上面的 `agent + tools + router` 是标准 ReAct 模式,`langchain` 包提供了**一行创建**的封装:
 
@@ -258,8 +260,10 @@ for await (const [mode, payload] of stream) {
 import { createAgent } from 'langchain';
 
 const agent = createAgent({
-  llm: model,
+  model: model,            // 注意字段名是 'model',不是 'llm'
   tools: [freeTool, tushareTool],
+  systemPrompt: '...',
+  checkpointer: new MemorySaver(),
 });
 
 const result = await agent.invoke({ messages: [...] });
@@ -273,7 +277,7 @@ const agent = createReactAgent({ llm: model, tools: [...] });
 
 // 新(推荐):
 import { createAgent } from 'langchain';
-const agent = createAgent({ llm: model, tools: [...] });
+const agent = createAgent({ model: model, tools: [...] });
 ```
 
 **`ToolNode` 和 `toolsCondition` 没有弃用** —— 仍在 `@langchain/langgraph/prebuilt`,可以单独使用。
@@ -282,19 +286,21 @@ const agent = createAgent({ llm: model, tools: [...] });
 
 | 你手写的 | `createAgent` 自动给的 |
 |---|---|
-| callModel 函数 | ✅ |
+| callModel 函数 | ✅(内部节点名 `model_request`) |
 | executeTools / ToolNode | ✅(用 ToolNode,不走我们自定义的副通道) |
-| routeAfterAgent | ✅ |
+| routeAfterAgent | ✅(内部用 `toolsCondition`) |
 | MAX_ITER | recursionLimit(默认 25) |
-| stream 监听 | ✅ |
+| stream 监听 | ✅(`streamMode: 'messages'` + 节点过滤 `langgraph_node === 'model_request'`) |
+| 系统提示去重 | ✅ 用 `systemPrompt` 字段独立注入,不存进 state.messages,天然无重复 |
+| getState 类型 | ❌ `ReactAgent.getState()` 标注返回 `never`(故意为之),需手动 cast 到 `StateSnapshot` |
 
-**那为什么我们还要手写一遍?**
+**那为什么还要手写一遍?**
 
-因为标准 `createAgent` 的 ToolNode 会调 `tool.func`,而我们的 `func` 故意只返回 trimmed JSON(不带 chart_payload)。要让 chart 走副通道,就需要**自定义 tools 节点**。学习目的下,手写比用 prebuilt 更能理解原理。
+因为标准 `createAgent` 的 ToolNode 会调 `tool.func`,而我们的 `func` 故意只返回 trimmed JSON(不带 chart_payload)。要让 chart 走副通道,在 `createAgent` 下需要用 per-session `Map` + 工具内 `interrupt()`(详见 `learn/create_agent.md`)—— 能做,但工具承担了非纯职责。
 
 **生产环境的选择:**
 - 简单 ReAct + 标准 tool → `createAgent` 一把梭
-- 需要副通道 / 多 agent / 复杂路由 → 手写 StateGraph
+- 需要副通道 / 多 agent / 复杂路由 → 手写 StateGraph(本项目默认 langgraph)
 
 ---
 
@@ -306,7 +312,7 @@ const agent = createAgent({ llm: model, tools: [...] });
 | **核心循环** | `for (let iter...)` 显式 | 隐式(edge 形成回环) |
 | **状态管理** | 局部变量 `messages.push()` | State + reducer(声明式) |
 | **工具调用聚合** | 自己写 `ToolCallAggregator` 拼流式 chunks | `bound.invoke()` 一次性返回 |
-| **流式 token** | ✅ 逐 token 推 `text` event | ❌ 当前版本只 invoke,没 stream token |
+| **流式 token** | ✅ 逐 token 推 `text` event | ✅ `streamMode: 'messages'` + `langgraph_node === 'model_request'` 过滤 |
 | **副通道 chart** | generator 直接 `yield` | 写入 state.emittedCharts,stream 监听 |
 | **终止逻辑** | `toolCalls.length === 0` 时 break | conditional edge 路由到 END |
 | **最大迭代** | MAX_ITER=4 | recursionLimit=8 |
@@ -365,12 +371,15 @@ UI 发 `分析一下 300033`,观察后端日志:
 
 ## 九、下一步学什么
 
-学完 ReAct 后,按推荐顺序:
+学完 ReAct 后,按推荐顺序(✅ = 已完成):
 
-1. **Checkpoint + HITL** —— 加 MemorySaver,加一个 `interrupt()` 演示"确认高风险操作"
-2. **Subgraph + 多 agent** —— 把 `analyze_stock_free` 拆成"研究员 agent" + "总结员 agent",用 supervisor 模式协调
-3. **Token 级流式** —— 改 `callModel` 用 `stream()`,前端体验提升
-4. **Conditional Branching** —— 实现一个真正多分支的 graph(比如:Tushare 失败 → 走 Sina 分支;Sina 也失败 → 走"提示重试"分支)
+1. ✅ **Checkpoint + HITL** —— MemorySaver + `interrupt()` 演示"确认高风险操作",见 `learn/hitl_confirmation.md`
+2. ✅ **Subgraph + 多 agent** —— researcher + summarizer 子图,supervisor 协调,见 `learn/supervisor_multiagent.md`
+3. ✅ **Token 级流式** —— `streamMode: 'messages'` 已在 langgraph / supervisor / create-agent 三套编排器启用
+4. ✅ **`createAgent` prebuilt 对比** —— 见 `learn/create_agent.md`
+5. ✅ **Summary Memory** —— 长会话压缩,见 `backend/src/chat/summary-memory.service.ts`
+6. ⭐ **Conditional Branching** —— 实现一个真正多分支的 graph(比如:Tushare 失败 → 走 Sina 分支;Sina 也失败 → 走"提示重试"分支)
+7. ⭐ **Output validator** —— 模型输出后 Zod 校验,挡住"茅台目标价 5000"这类幻觉
 
 ---
 
@@ -380,5 +389,7 @@ UI 发 `分析一下 300033`,观察后端日志:
 - ReAct 论文: https://arxiv.org/abs/2210.03629
 - LangGraph 例子仓库: https://github.com/langchain-ai/langgraphjs
 - 项目内代码:
-  - `backend/src/chat/langgraph-orchestrator.ts` — 学习版
-  - `backend/src/chat/chat.orchestrator.ts` — 手写版(对比用)
+  - `backend/src/chat/langgraph-orchestrator.ts` — 生产默认(`ORCHESTRATOR=langgraph`)
+  - `backend/src/chat/chat.orchestrator.ts` — 手写版(`ORCHESTRATOR=manual`,对比用)
+  - `backend/src/chat/supervisor-orchestrator.ts` — supervisor 多 agent 版
+  - `backend/src/chat/create-agent-orchestrator.ts` — `createAgent` prebuilt 版,见 `learn/create_agent.md`

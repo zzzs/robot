@@ -3,6 +3,7 @@ import { ChatAnthropic } from '@langchain/anthropic';
 import {
   BaseMessage,
   HumanMessage,
+  SystemMessage,
 } from '@langchain/core/messages';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { z } from 'zod';
@@ -294,14 +295,28 @@ export class CreateAgentOrchestrator implements ChatOrchestratorInterface {
     );
 
     const sessionHistory = this.historySvc.get(dto.sessionId);
-    const history = await sessionHistory.getMessages();
+    const history = await this.historySvc.getMessages(dto.sessionId);
     const human = new HumanMessage(dto.message);
     await sessionHistory.addMessage(human);
 
-    // createAgent 通过 systemPrompt 字段在每次 model call 时注入系统提示,
-    // 不需要把 SystemMessage 放进 messages,因此没有 langgraph 编排器的
-    // "checkpoint + historySvc 双写导致 SystemMessage 重复"问题。
-    const initialMessages: BaseMessage[] = [...history, human];
+    // createAgent 用静态 systemPrompt 字段注入 prompt,无法 per-request 改写。
+    // 处理 summary 的方式:把 history 头上的 summary 合并成一个 HumanMessage
+    // 形式的 "[历史对话摘要]" 块,放在 history 之前。这样既不破坏 createAgent 的
+    // 静态 prompt,又把 summary 上下文带进 model。
+    let initialMessages: BaseMessage[];
+    if (
+      history.length > 0 &&
+      history[0] instanceof SystemMessage &&
+      (history[0].additional_kwargs as { __summary?: boolean } | undefined)?.__summary === true
+    ) {
+      const summaryText = contentToString(history[0].content);
+      const summaryAsHuman = new HumanMessage(
+        `[以下是历史对话的摘要,供你参考]\n${summaryText}`,
+      );
+      initialMessages = [summaryAsHuman, ...history.slice(1), human];
+    } else {
+      initialMessages = [...history, human];
+    }
 
     // 登记 per-session chart 缓冲
     const chartBuffer: ChartPayload[] = [];
