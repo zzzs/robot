@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ChatController } from './chat.controller';
+import { CacheTestController } from './cache-test.controller';
 import { ChatService, CHAT_ORCHESTRATOR } from './chat.service';
 import { ChatHistoryService } from './chat-history.service';
 import { SummaryMemoryService } from './summary-memory.service';
@@ -16,7 +17,7 @@ import { CaiCompModule } from '../cai-comp/cai-comp.module';
 
 @Module({
   imports: [StockModule, NewsRagModule, CaiCompModule],
-  controllers: [ChatController],
+  controllers: [ChatController, CacheTestController],
   providers: [
     ChatService,
     SummaryMemoryService,

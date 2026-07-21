@@ -19,6 +19,7 @@
 | [`hitl_confirmation.md`](hitl_confirmation.md) | MemorySaver + interrupt + HITL 详解 | 想加"暂停等确认"功能时看 |
 | [`create_agent.md`](create_agent.md) | createAgent vs 手写 StateGraph 对比 | 想知道何时用 prebuilt、何时手写时看 |
 | [`cai_comp_mcp.md`](cai_comp_mcp.md) | MCP 协议教学 + cai-comp server 实战 | 想给 agent 加新 MCP 工具、或学 MCP 协议时看 |
+| [`prompt_caching.md`](prompt_caching.md) | Prompt caching 调研报告(DashScope 自动缓存 vs Anthropic 显式标记) | 想优化 LLM 成本时看 |
 
 ---
 
