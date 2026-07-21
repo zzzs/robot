@@ -34,6 +34,10 @@ import { AnalysisResult, ChartPayload } from '../stock/stock.types';
 import { normalizeTsCode } from '../stock/normalize-ts-code';
 import { ChatOrchestratorInterface } from './chat.service';
 import { SEARCH_NEWS_TOOL } from '../news/news-rag.module';
+import {
+  CAI_COMP_GET_DETAIL_TOOL,
+  CAI_COMP_LIST_TOOL,
+} from '../cai-comp/cai-comp.module';
 
 /**
  * ───────────────────────────────────────────────────────────────────────────
@@ -84,6 +88,8 @@ const SYSTEM_PROMPT = [
   '## 工具选择',
   '- **analyze_stock_free**:用户问 K 线 / 走势 / 技术指标 / 趋势分析时调用。',
   '- **search_news**:用户问"最近有什么新闻 / 消息 / 公告"或"X 最近出什么事了"时调用。',
+  '- **list_comps**:用户问"有哪些组件" / "最近有什么组件" / "X 提交了什么组件"时调用。返回组件摘要列表。',
+  '- **get_comp_detail**:已知组件 ID(从 list_comps 拿到)想看详情时调用。',
   '- 都不适用 → 直接用中文回答,不调任何工具。',
   '',
   '## 调用 analyze_stock_free 后',
@@ -99,6 +105,12 @@ const SYSTEM_PROMPT = [
   '',
   '## 分析诚信',
   '绝不捏造数据。仅引用工具返回的实际内容。',
+  '',
+  '## 调用 list_comps / get_comp_detail 后',
+  '- `list_comps` 返回的 `data[].id` 可作为 `get_comp_detail` 的入参,组合查询。',
+  '- status="unauthorized" → 告诉用户 token 过期,需更新 CAI_*_TOKEN env vars,不要重试。',
+  '- status="not-found" → 组件 ID 有误。',
+  '- status="unavailable" → MCP server 未启动,告诉用户检查 backend 日志。',
 ].join('\n');
 
 const NO_DATA_REPLY = 'No data available for analysis';
@@ -119,6 +131,10 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
     private readonly tushareTool: DynamicStructuredTool,
     @Inject(SEARCH_NEWS_TOOL)
     private readonly searchNewsTool: DynamicStructuredTool,
+    @Inject(CAI_COMP_GET_DETAIL_TOOL)
+    private readonly caiCompDetailTool: DynamicStructuredTool,
+    @Inject(CAI_COMP_LIST_TOOL)
+    private readonly caiCompListTool: DynamicStructuredTool,
     @Inject(SINA_ANALYSIS_SERVICE)
     private readonly sinaAnalysis: StockAnalysisService,
     @Inject(MCP_ANALYSIS_SERVICE)
@@ -129,6 +145,8 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
       this.freeTool,
       this.tushareTool,
       this.searchNewsTool,
+      this.caiCompDetailTool,
+      this.caiCompListTool,
     ]);
 
     // 3️⃣ 定义 agent 节点:调用模型,拿到 AIMessage
@@ -226,6 +244,32 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
           }
           continue;
         }
+
+        // cai-comp 工具 —— 直接 invoke,func 内部走 MCP client
+        if (tc.name === 'get_comp_detail' || tc.name === 'list_comps') {
+          const tool =
+            tc.name === 'get_comp_detail'
+              ? this.caiCompDetailTool
+              : this.caiCompListTool;
+          try {
+            const result = (await tool.invoke(args)) as string;
+            newMessages.push(
+              new ToolMessage({
+                tool_call_id: tc.id ?? '',
+                content:
+                  typeof result === 'string' ? result : JSON.stringify(result),
+              }),
+            );
+          } catch (err) {
+            newMessages.push(
+              new ToolMessage({
+                tool_call_id: tc.id ?? '',
+                content: `${tc.name} error: ${(err as Error).message}`,
+              }),
+            );
+          }
+          continue;
+        }
         const rawTsCode = typeof args.ts_code === 'string' ? args.ts_code : '';
         const tsCode = normalizeTsCode(rawTsCode);
         const range =
@@ -296,7 +340,11 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
       state: typeof AgentState.State,
     ): Partial<typeof AgentState.State> => {
       if (!state.emittedCharts || state.emittedCharts.length === 0) {
-        return {};
+        // 没图 → 没 HITL 要弹 → 直接当成"已确认",让 routeAfterConfirm 把
+        // 流程路由回 agent 写总结。不能返 {},否则 confirmed 还停在初始 false
+        // 会被 routeAfterConfirm 当成"用户取消"路由到 END,导致 agent 没机会
+        // 写总结文本(典型表现:tool 调了但前端拿不到回答)。
+        return { confirmed: true };
       }
       const interruptResult: unknown = interrupt({
         reason: '⚠️ 技术分析仅供参考,不构成投资建议。投资有风险,请独立决策。',
@@ -455,7 +503,14 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
     }
 
     // 用户取消(confirmed=false):写一条取消消息
+    // ⚠️ 必须同时满足 emittedCharts 非空 —— 否则 confirm 节点根本没 interrupt,
+    // confirmed 还停在初始 false 会被误判为"用户取消"(实际是 analyze_stock_free
+    // 返回 no-data,从未弹过确认框)。
+    const cancelledCharts =
+      (stateAfter?.values as { emittedCharts?: unknown[] } | undefined)
+        ?.emittedCharts?.length ?? 0;
     if (
+      cancelledCharts > 0 &&
       (stateAfter?.values as { confirmed?: boolean } | undefined)?.confirmed ===
         false &&
       stateAfter.next.length === 0

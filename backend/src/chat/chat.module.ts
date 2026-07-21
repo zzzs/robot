@@ -12,9 +12,10 @@ import { SupervisorOrchestrator } from './supervisor-orchestrator';
 import { CreateAgentOrchestrator } from './create-agent-orchestrator';
 import { StockModule } from '../stock/stock.module';
 import { NewsRagModule } from '../news/news-rag.module';
+import { CaiCompModule } from '../cai-comp/cai-comp.module';
 
 @Module({
-  imports: [StockModule, NewsRagModule],
+  imports: [StockModule, NewsRagModule, CaiCompModule],
   controllers: [ChatController],
   providers: [
     ChatService,

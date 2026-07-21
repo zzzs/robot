@@ -40,6 +40,18 @@ export default () => ({
     threshold: Number.parseInt(process.env.SUMMARY_THRESHOLD ?? '20', 10),
     recentKeep: Number.parseInt(process.env.SUMMARY_RECENT_KEEP ?? '6', 10),
   },
+  // 公司组件中心 MCP server 子进程配置。
+  // 见 mcp-servers/cai-comp/。Auth 走 5 个 cookie env vars + 3 个 header env vars。
+  caiComp: {
+    baseUrl:
+      process.env.CAI_COMP_BASE_URL ?? 'https://pi.paas-test.cai-inc.com',
+    timeoutMs: Number.parseInt(process.env.CAI_COMP_TIMEOUT_MS ?? '10000', 10),
+    maxRetries: Number.parseInt(process.env.CAI_COMP_MAX_RETRIES ?? '1', 10),
+    mcpCommand: process.env.CAI_COMP_MCP_COMMAND ?? 'node',
+    mcpArgs:
+      process.env.CAI_COMP_MCP_ARGS ??
+      '../mcp-servers/cai-comp/dist/index.js',
+  },
   // News RAG 配置 —— 默认走内置 fixture(20 篇 A 股示例新闻,离线可用),
   // 网络条件允许时改 NEWS_RSS_URLS 换真源(详见 .env.example)
   news: {

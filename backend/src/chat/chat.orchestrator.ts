@@ -23,6 +23,10 @@ import {
 import { StockAnalysisService } from '../stock/stock-analysis.service';
 import { AnalysisResult } from '../stock/stock.types';
 import { SEARCH_NEWS_TOOL } from '../news/news-rag.module';
+import {
+  CAI_COMP_GET_DETAIL_TOOL,
+  CAI_COMP_LIST_TOOL,
+} from '../cai-comp/cai-comp.module';
 import { normalizeTsCode } from '../stock/normalize-ts-code';
 import { ChatOrchestratorInterface } from './chat.service';
 
@@ -32,6 +36,7 @@ const SYSTEM_PROMPT = [
   '## 工具选择',
   '- **analyze_stock_free**:用户问 K 线 / 走势 / 技术指标 / 趋势分析时调用。',
   '- **search_news**:用户问"最近有什么新闻 / 消息 / 公告"或"X 最近出什么事了"时调用。',
+  '- **list_comps / get_comp_detail**:用户问公司组件 / "组件 2542" / "黑风最近提交了什么组件"时调用。',
   '- 都不适用 → 直接用中文回答,不调任何工具。',
   '',
   '## 调用 analyze_stock_free 后',
@@ -48,6 +53,12 @@ const SYSTEM_PROMPT = [
   '',
   '## 分析诚信',
   '绝不捏造、估算或幻觉任何价格、指标、信号或新闻。仅引用工具返回的数据。',
+  '',
+  '## 公司组件查询',
+  '- `list_comps` 返回的 `data[].id` 可作为 `get_comp_detail` 入参,组合查询。',
+  '- status="unauthorized" → 告诉用户 token 过期,需更新 CAI_*_TOKEN env vars,不要重试。',
+  '- status="not-found" → 组件 ID 有误。',
+  '- status="unavailable" → MCP server 未启动,告诉用户检查 backend 日志。',
 ].join('\n');
 
 const MAX_ITER = 4;
@@ -70,6 +81,10 @@ export class ChatOrchestrator implements ChatOrchestratorInterface {
     private readonly freeTool: DynamicStructuredTool,
     @Inject(SEARCH_NEWS_TOOL)
     private readonly searchNewsTool: DynamicStructuredTool,
+    @Inject(CAI_COMP_GET_DETAIL_TOOL)
+    private readonly caiCompDetailTool: DynamicStructuredTool,
+    @Inject(CAI_COMP_LIST_TOOL)
+    private readonly caiCompListTool: DynamicStructuredTool,
     @Inject(MCP_ANALYSIS_SERVICE)
     private readonly mcpAnalysis: StockAnalysisService,
     @Inject(SINA_ANALYSIS_SERVICE)
@@ -106,6 +121,8 @@ export class ChatOrchestrator implements ChatOrchestratorInterface {
       this.freeTool,
       this.tushareTool,
       this.searchNewsTool,
+      this.caiCompDetailTool,
+      this.caiCompListTool,
     ]);
 
     let finalText = '';

@@ -6,6 +6,7 @@ import {
   BaseMessage,
   HumanMessage,
   SystemMessage,
+  ToolMessage,
 } from '@langchain/core/messages';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { Annotation, END, START, StateGraph } from '@langchain/langgraph';
@@ -20,6 +21,10 @@ import {
   MCP_ANALYSIS_SERVICE,
   SINA_ANALYSIS_SERVICE,
 } from '../stock/stock.module';
+import {
+  CAI_COMP_GET_DETAIL_TOOL,
+  CAI_COMP_LIST_TOOL,
+} from '../cai-comp/cai-comp.module';
 import { StockAnalysisService } from '../stock/stock-analysis.service';
 import { AnalysisContext, ChartPayload } from '../stock/stock.types';
 import { buildResearcherSubgraph } from './subgraphs/researcher.subgraph';
@@ -59,16 +64,28 @@ const SUPERVISOR_SYSTEM_PROMPT = [
   '路由选项:',
   '- "researcher"     : 用户问的是股票,但 AnalysisContext.status 还是 pending → 让研究员去拉数据',
   '- "summarizer"     : AnalysisContext.status 是 ok/no-data/insufficient → 让总结员写最终回复',
-  '- "respond_directly": 完全不是股票问题(天气、闲聊、编程等) → 直接用通用助手回答,不走分析流程',
+  '- "respond_directly": 完全不是股票问题(天气、闲聊、编程、**公司组件查询** 等) → 直接用通用助手回答,不走分析流程',
   '- "end"            : 工作完成,结束',
   '',
   '判断顺序:',
   '1. 看 AnalysisContext.status:pending → researcher;ok/no-data/insufficient → summarizer',
   '2. 但如果消息一看就不是股票问题(没有股票代码、没有"分析/股票/行情"等关键词),直接 respond_directly',
+  '   - "现在有哪些组件" / "组件 X" / "黑风提交了什么" 这种问公司组件中心的 → respond_directly(respond_directly 节点会调 list_comps / get_comp_detail)',
 ].join('\n');
 
-const RESPOND_DIRECTLY_PROMPT =
-  '你是一个乐于助人的中文助理。用简洁的中文回答用户的问题。';
+const RESPOND_DIRECTLY_PROMPT = [
+  '你是一个乐于助人的中文助理。用简洁的中文回答用户的问题。',
+  '',
+  '可用工具(非股票类查询):',
+  '- **list_comps**:用户问"有哪些组件" / "最近有什么组件" / "X 提交了什么组件" → 调此工具',
+  '- **get_comp_detail**:已知组件 ID(从 list_comps 拿到) → 调此工具看详情',
+  '',
+  '工具返回 status 字段:',
+  '- "unauthorized" → token 过期,告诉用户更新 CAI_*_TOKEN env vars',
+  '- "not-found" → 组件 ID 不存在',
+  '- "unavailable" → MCP server 未启动,告诉用户检查 backend 日志',
+  '- 否则正常引用工具返回的数据,不要捏造。',
+].join('\n');
 
 const RouteSchema = z.object({
   next: z.enum(['researcher', 'summarizer', 'respond_directly', 'end']),
@@ -135,6 +152,10 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
     private readonly sinaAnalysis: StockAnalysisService,
     @Inject(MCP_ANALYSIS_SERVICE)
     private readonly mcpAnalysis: StockAnalysisService,
+    @Inject(CAI_COMP_GET_DETAIL_TOOL)
+    private readonly caiCompDetailTool: DynamicStructuredTool,
+    @Inject(CAI_COMP_LIST_TOOL)
+    private readonly caiCompListTool: DynamicStructuredTool,
   ) {
     // Supervisor routing: 用 bindTools 而不是 withStructuredOutput。
     // 在 Aliyun 的 Anthropic 兼容网关下,withStructuredOutput 默认走 tool_choice
@@ -150,7 +171,10 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
       func: (input) => Promise.resolve(JSON.stringify(input)),
     });
     const supervisorModel = this.model.bindTools([routeTool]);
-    this.respondDirectlyModel = this.model;
+    this.respondDirectlyModel = this.model.bindTools([
+      this.caiCompDetailTool,
+      this.caiCompListTool,
+    ]);
 
     // ─── Build subgraphs ──────────────────────────────────────────────
     const researcherGraph = buildResearcherSubgraph({
@@ -268,11 +292,47 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
         (m) => !(m instanceof SystemMessage),
       );
       try {
-        const response = await this.respondDirectlyModel.invoke([
+        let messages: BaseMessage[] = [
           new SystemMessage(RESPOND_DIRECTLY_PROMPT),
           ...messagesWithoutSystem,
-        ]);
-        return { messages: [response as AIMessage] };
+        ];
+        // 简化 ReAct 循环:最多 2 轮(允许调 1 次 cai-comp 工具后再总结)。
+        // cai-comp 工具是只读的,不需要 chart 副通道 / HITL,所以不需要走
+        // 像 analyze_stock 那样的完整 researcher + summarizer 流程。
+        for (let iter = 0; iter < 2; iter++) {
+          const response = (await this.respondDirectlyModel.invoke(messages)) as AIMessage;
+          messages = [...messages, response];
+          const toolCalls = response.tool_calls ?? [];
+          if (toolCalls.length === 0) {
+            return { messages: [response] };
+          }
+          // 执行 cai-comp 工具调用
+          for (const tc of toolCalls) {
+            const args = (tc.args ?? {}) as Record<string, unknown>;
+            let resultStr: string;
+            try {
+              if (tc.name === 'get_comp_detail') {
+                resultStr = (await this.caiCompDetailTool.invoke(args)) as string;
+              } else if (tc.name === 'list_comps') {
+                resultStr = (await this.caiCompListTool.invoke(args)) as string;
+              } else {
+                resultStr = JSON.stringify({ status: 'unknown-tool', name: tc.name });
+              }
+            } catch (err) {
+              resultStr = `${tc.name} error: ${(err as Error).message}`;
+            }
+            messages = [
+              ...messages,
+              new ToolMessage({
+                tool_call_id: tc.id ?? '',
+                content: typeof resultStr === 'string' ? resultStr : JSON.stringify(resultStr),
+              }),
+            ];
+          }
+        }
+        // Fallback: 多轮没收敛,直接拿最后一条 AIMessage 返回
+        const last = messages[messages.length - 1];
+        return { messages: [last instanceof AIMessage ? last : new AIMessage('')] };
       } catch (err) {
         const msg = (err as Error).message ?? String(err);
         this.logger.error(`respond_directly LLM call failed: ${msg}`);
