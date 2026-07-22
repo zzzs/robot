@@ -20,6 +20,9 @@ import {
 import { messagesStateReducer } from '@langchain/langgraph';
 import { ChatHistoryService, contentToString } from './chat-history.service';
 import { SummaryMemoryService } from './summary-memory.service';
+import { PostgresPoolService } from '../postgres/postgres-pool.service';
+import { POSTGRES_SAVER } from '../postgres/postgres.constants';
+import { PostgresSaver } from '@langchain/langgraph-checkpoint-postgres';
 import { ChatMessageDto } from './dto/chat-message.dto';
 import { ChatStreamEvent } from './chat-stream.types';
 import { CHAT_MODEL } from './chat.constants';
@@ -121,10 +124,13 @@ const MAX_ITER = 8;
 export class LangGraphOrchestrator implements ChatOrchestratorInterface {
   private readonly logger = new Logger(LangGraphOrchestrator.name);
   private readonly compiled;
+  private readonly checkpointer: MemorySaver | PostgresSaver;
 
   constructor(
     @Inject(CHAT_MODEL) private readonly model: ChatAnthropic,
     private readonly historySvc: ChatHistoryService,
+    private readonly poolSvc: PostgresPoolService,
+    @Inject(POSTGRES_SAVER) private readonly sharedSaver: PostgresSaver | null,
     @Inject(ANALYZE_STOCK_FREE_TOOL)
     private readonly freeTool: DynamicStructuredTool,
     @Inject(ANALYZE_STOCK_TOOL)
@@ -360,8 +366,11 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
       return 'agent';
     };
 
-    // 8️⃣ 拼装 graph + MemorySaver checkpointer
-    const checkpointer = new MemorySaver();
+    // 8️⃣ 拼装 graph + checkpointer
+    // PostgresSaver(共享单例,由 PostgresModule 管理 setup)
+    // 否则降级到 MemorySaver(进程重启丢,但开发能用)
+    const checkpointer: MemorySaver | PostgresSaver = this.sharedSaver ?? new MemorySaver();
+    this.checkpointer = checkpointer;
     this.compiled = new StateGraph(AgentState)
       .addNode('agent', callModel)
       .addNode('tools', executeTools)
@@ -372,6 +381,8 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
       .addConditionalEdges('confirm', routeAfterConfirm)
       .compile({ checkpointer });
   }
+
+  // setup() 由 PostgresModule 的 MigrationsTrackerService 统一调,这里不重复
 
   async *stream(dto: ChatMessageDto): AsyncGenerator<ChatStreamEvent> {
     this.logger.log(

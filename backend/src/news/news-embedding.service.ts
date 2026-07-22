@@ -4,28 +4,33 @@ import { Document } from '@langchain/core/documents';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { OpenAIEmbeddings } from '@langchain/openai';
 import { MemoryVectorStore } from '@langchain/classic/vectorstores/memory';
+import { PGVectorStore } from '@langchain/community/vectorstores/pgvector';
 import { Embeddings } from '@langchain/core/embeddings';
+import { VectorStore } from '@langchain/core/vectorstores';
 import { NewsLoaderService } from './news-loader.service';
+import { PostgresPoolService } from '../postgres/postgres-pool.service';
 
 export type IngestStatus = 'idle' | 'loading' | 'ready' | 'failed';
 
 /**
  * RAG pipeline: split → batch-embed → vector store.
  *
+ * 双模式 vector store:
+ *   - DATABASE_URL 设了 → PGVectorStore(持久化,重启无需 reingest)
+ *   - 没设 → MemoryVectorStore(开发降级,进程重启丢)
+ *
  * Embedding 用 GLM embedding-3(OpenAI 兼容,open.bigmodel.cn)。
  * 本地 HuggingFace embedding 在本机不可用(HF 被墙 + 镜像限速 + ONNX Runtime
  * macOS 12.x bug)。GLM API 是唯一可用方案。
- *
- * RAG 五个环节(Loader/Splitter/Embed/Store/Retrieve)完全不变,
- * 只是 Embed 从本地 ONNX 换成 GLM API。
  */
 @Injectable()
 export class NewsEmbeddingService implements OnModuleInit {
   private readonly logger = new Logger(NewsEmbeddingService.name);
   private readonly splitter: RecursiveCharacterTextSplitter;
   private readonly embeddings: Embeddings;
-  private readonly vectorStore: MemoryVectorStore;
+  private vectorStore: VectorStore;  // mutable: 占位 MemoryVectorStore,init 后换 PGVectorStore
   private readonly configService: ConfigService;
+  private readonly poolSvc: PostgresPoolService;
 
   status: IngestStatus = 'idle';
   chunkCount = 0;
@@ -33,8 +38,10 @@ export class NewsEmbeddingService implements OnModuleInit {
   constructor(
     private readonly loader: NewsLoaderService,
     config: ConfigService,
+    poolSvc: PostgresPoolService,
   ) {
     this.configService = config;
+    this.poolSvc = poolSvc;
     this.splitter = new RecursiveCharacterTextSplitter({
       chunkSize: 800,
       chunkOverlap: 100,
@@ -50,10 +57,39 @@ export class NewsEmbeddingService implements OnModuleInit {
           'https://open.bigmodel.cn/api/paas/v4',
       },
     });
+    // PGVectorStore 在 onModuleInit 异步初始化(需要建表)
+    // 构造期先用 MemoryVectorStore 占位,PGVectorStore 初始化后替换
     this.vectorStore = new MemoryVectorStore(this.embeddings);
   }
 
-  onModuleInit(): void {
+  async onModuleInit(): Promise<void> {
+    // 如果有 Postgres,初始化 PGVectorStore
+    if (this.poolSvc.isAvailable()) {
+      try {
+        const pgStore = await PGVectorStore.initialize(this.embeddings, {
+          postgresConnectionOptions: {
+            connectionString: this.configService.get<string>('database.url'),
+          },
+          tableName: 'news_vectors',
+          dimensions: 512,  // GLM embedding-3 实测返 512 维
+          distanceStrategy: 'cosine',
+          columns: {
+            contentColumnName: 'content',     // 跟 migration 002 对齐
+            metadataColumnName: 'metadata',
+            vectorColumnName: 'embedding',
+          },
+        });
+        // 替换占位 store
+        this.vectorStore = pgStore;
+        this.logger.log('PGVectorStore initialized (持久化向量库)');
+      } catch (err) {
+        this.logger.error(
+          `PGVectorStore init failed, fallback to memory: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    // ingest 启动异步跑(已有逻辑)
     void this.ingest().catch((err: unknown) => {
       this.logger.error(`ingest crashed: ${(err as Error).message}`);
       this.status = 'failed';
@@ -68,6 +104,20 @@ export class NewsEmbeddingService implements OnModuleInit {
     this.status = 'loading';
     const startedAt = Date.now();
     try {
+      // PGVectorStore 已经有数据就跳过(避免重启重复 ingest)
+      if (this.vectorStore instanceof PGVectorStore && this.poolSvc.pool) {
+        const result = await this.poolSvc.pool.query(
+          'SELECT COUNT(*) FROM news_vectors',
+        );
+        const count = parseInt(result.rows[0].count, 10);
+        if (count > 0) {
+          this.logger.log(`news_vectors already has ${count} rows, skipping ingest`);
+          this.chunkCount = count;
+          this.status = 'ready';
+          return;
+        }
+      }
+
       const docs = await this.loader.loadNews();
       if (docs.length === 0) {
         this.logger.warn('no articles to ingest; staying in idle state');

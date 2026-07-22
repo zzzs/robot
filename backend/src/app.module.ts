@@ -6,10 +6,12 @@ import { StockModule } from './stock/stock.module';
 import { NewsRagModule } from './news/news-rag.module';
 import { EvalModule } from './eval/eval.module';
 import { CaiCompModule } from './cai-comp/cai-comp.module';
+import { PostgresModule } from './postgres/postgres.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true, load: [configuration] }),
+    PostgresModule,
     StockModule,
     NewsRagModule,
     CaiCompModule,

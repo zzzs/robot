@@ -20,6 +20,9 @@
 | [`create_agent.md`](create_agent.md) | createAgent vs 手写 StateGraph 对比 | 想知道何时用 prebuilt、何时手写时看 |
 | [`cai_comp_mcp.md`](cai_comp_mcp.md) | MCP 协议教学 + cai-comp server 实战 | 想给 agent 加新 MCP 工具、或学 MCP 协议时看 |
 | [`prompt_caching.md`](prompt_caching.md) | Prompt caching 调研报告(DashScope 自动缓存 vs Anthropic 显式标记) | 想优化 LLM 成本时看 |
+| [`persistence_roadmap.md`](persistence_roadmap.md) | 从 in-memory 到企业级持久化的路线图 | 想从单机 demo 升级到生产部署时看 |
+| [`enterprise_roadmap.md`](enterprise_roadmap.md) | 存储之外的企业化维度(鉴权/观测/成本/DevOps/合规/安全) | 完成存储升级后,继续做生产化的下一步 |
+| [`postgres_runbook.md`](postgres_runbook.md) | Postgres 维护手册(表含义 + 常用 SQL + 排错 + 危险操作) | 上生产后日常运维、出问题排查时看 |
 
 ---
 
@@ -78,8 +81,9 @@ Orchestrator.stream() (4 选 1)           ← langgraph-orchestrator.ts
 |---|---|---|
 | `ChatOrchestrator` / `LangGraphOrchestrator` / `SupervisorOrchestrator` / `CreateAgentOrchestrator` | 4 套 orchestrator 实现 | `chat/*.orchestrator.ts` |
 | `ChatService` | orchestrator 工厂 + 共享接口 | `chat/chat.service.ts` |
-| `ChatHistoryService` | 会话历史(In-memory,按 sessionId 隔离) | `chat/chat-history.service.ts` |
+| `ChatHistoryService` | 会话历史(DATABASE_URL 设了走 Postgres,否则 in-memory) | `chat/chat-history.service.ts` |
 | `SummaryMemoryService` | 长会话压缩,在 ChatHistoryService.getMessages 透明拦截 | `chat/summary-memory.service.ts` |
+| `PostgresModule` | 共享 Postgres Pool + migration runner(全局 module) | `postgres/postgres.module.ts` |
 | `StockAnalysisService` | 数据源无关的分析编排(可注入 Mcp 或 Sina) | `stock/stock-analysis.service.ts` |
 | `IndicatorService` | 纯函数指标计算 | `stock/indicators/indicator.service.ts` |
 | `SignalDeriver` / `TrendScorer` | 离散信号 + 综合评分 | `stock/analysis/*.ts` |

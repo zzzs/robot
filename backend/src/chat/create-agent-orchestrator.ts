@@ -19,6 +19,9 @@ import {
 // 见 tasks.md 1.1 / 1.2。
 import { createAgent } from 'langchain';
 import { ChatHistoryService, contentToString } from './chat-history.service';
+import { PostgresPoolService } from '../postgres/postgres-pool.service';
+import { POSTGRES_SAVER } from '../postgres/postgres.constants';
+import { PostgresSaver } from '@langchain/langgraph-checkpoint-postgres';
 import { ChatMessageDto } from './dto/chat-message.dto';
 import { ChatStreamEvent } from './chat-stream.types';
 import { CHAT_MODEL } from './chat.constants';
@@ -108,7 +111,7 @@ type ToolFuncSignature = (
 export class CreateAgentOrchestrator implements ChatOrchestratorInterface {
   private readonly logger = new Logger(CreateAgentOrchestrator.name);
   private readonly compiled;
-  private readonly checkpointer = new MemorySaver();
+  private readonly checkpointer: MemorySaver | PostgresSaver;
 
   /**
    * per-session chart 缓冲:工具 func 内 push chart_payload,stream() 读取
@@ -134,6 +137,8 @@ export class CreateAgentOrchestrator implements ChatOrchestratorInterface {
   constructor(
     @Inject(CHAT_MODEL) private readonly model: ChatAnthropic,
     private readonly historySvc: ChatHistoryService,
+    private readonly poolSvc: PostgresPoolService,
+    @Inject(POSTGRES_SAVER) private readonly sharedSaver: PostgresSaver | null,
     @Inject(ANALYZE_STOCK_FREE_TOOL)
     private readonly freeTool: DynamicStructuredTool,
     @Inject(ANALYZE_STOCK_TOOL)
@@ -169,6 +174,9 @@ export class CreateAgentOrchestrator implements ChatOrchestratorInterface {
       fallback: this.sinaAnalysis,
     });
 
+    // PostgresSaver 共享单例(PostgresModule 管理 setup) / MemorySaver 降级
+    this.checkpointer = this.sharedSaver ?? new MemorySaver();
+
     this.compiled = createAgent({
       model: this.model,
       tools: [
@@ -182,6 +190,8 @@ export class CreateAgentOrchestrator implements ChatOrchestratorInterface {
       checkpointer: this.checkpointer,
     });
   }
+
+  // setup() 由 PostgresModule 的 MigrationsTrackerService 统一调,这里不重复
 
   /**
    * 构造一个 chart-capturing 工具。关键点:

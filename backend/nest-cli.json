@@ -12,6 +12,10 @@
       {
         "include": "**/datasets/**/*.json",
         "watchAssets": true
+      },
+      {
+        "include": "**/migrations/**/*.sql",
+        "watchAssets": true
       }
     ]
   }

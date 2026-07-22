@@ -40,6 +40,14 @@ export default () => ({
     threshold: Number.parseInt(process.env.SUMMARY_THRESHOLD ?? '20', 10),
     recentKeep: Number.parseInt(process.env.SUMMARY_RECENT_KEEP ?? '6', 10),
   },
+  // Postgres 持久化配置
+  // DATABASE_URL 留空 → 自动降级到 in-memory(开发用,适合没装 Docker 时)
+  // 启用:1) docker compose up -d postgres  2) .env 里设 DATABASE_URL
+  // 详见 learn/postgres_runbook.md
+  database: {
+    url: process.env.DATABASE_URL ?? '',
+    poolMax: Number.parseInt(process.env.PG_POOL_MAX ?? '10', 10),
+  },
   // 公司组件中心 MCP server 子进程配置。
   // 见 mcp-servers/cai-comp/。Auth 走 5 个 cookie env vars + 3 个 header env vars。
   caiComp: {
