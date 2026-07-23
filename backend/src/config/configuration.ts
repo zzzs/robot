@@ -48,6 +48,13 @@ export default () => ({
     url: process.env.DATABASE_URL ?? '',
     poolMax: Number.parseInt(process.env.PG_POOL_MAX ?? '10', 10),
   },
+  // Reflexion 模式(ORCHESTRATOR=reflexion 时生效)
+  // Plan + Execute + Reflect,含 2 个 HITL 中断点(plan 确认 + 工具风险确认)
+  reflexion: {
+    maxRounds: Number.parseInt(process.env.REFLECTION_MAX_ROUNDS ?? '3', 10),
+    threshold: Number.parseInt(process.env.REFLECTION_THRESHOLD ?? '8', 10),
+    maxSteps: Number.parseInt(process.env.PLAN_EXECUTE_MAX_STEPS ?? '5', 10),
+  },
   // 公司组件中心 MCP server 子进程配置。
   // 见 mcp-servers/cai-comp/。Auth 走 5 个 cookie env vars + 3 个 header env vars。
   caiComp: {

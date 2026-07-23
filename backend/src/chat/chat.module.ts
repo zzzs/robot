@@ -11,6 +11,7 @@ import { ChatOrchestrator } from './chat.orchestrator';
 import { LangGraphOrchestrator } from './langgraph-orchestrator';
 import { SupervisorOrchestrator } from './supervisor-orchestrator';
 import { CreateAgentOrchestrator } from './create-agent-orchestrator';
+import { ReflexionOrchestrator } from './reflexion-orchestrator';
 import { StockModule } from '../stock/stock.module';
 import { NewsRagModule } from '../news/news-rag.module';
 import { CaiCompModule } from '../cai-comp/cai-comp.module';
@@ -26,12 +27,14 @@ import { CaiCompModule } from '../cai-comp/cai-comp.module';
     LangGraphOrchestrator,
     SupervisorOrchestrator,
     CreateAgentOrchestrator,
+    ReflexionOrchestrator,
     chatModelProvider,
     {
       // 根据 ORCHESTRATOR env 选择实现:
       //   'langgraph'     → LangGraph 状态机版本
       //   'supervisor'     → 多 agent (supervisor + researcher + summarizer)
       //   'create-agent'   → langchain 包 createAgent prebuilt 版 (学习对比用)
+      //   'reflexion'      → Plan + Execute + Reflect 模式 (含 2 个 HITL)
       //   其他           → 手写 ChatOrchestrator
       provide: CHAT_ORCHESTRATOR,
       inject: [
@@ -39,6 +42,7 @@ import { CaiCompModule } from '../cai-comp/cai-comp.module';
         LangGraphOrchestrator,
         SupervisorOrchestrator,
         CreateAgentOrchestrator,
+        ReflexionOrchestrator,
         ConfigService,
       ],
       useFactory: (
@@ -46,12 +50,14 @@ import { CaiCompModule } from '../cai-comp/cai-comp.module';
         langgraph: LangGraphOrchestrator,
         supervisor: SupervisorOrchestrator,
         createAgent: CreateAgentOrchestrator,
+        reflexion: ReflexionOrchestrator,
         config: ConfigService,
       ) => {
         const choice = config.get<string>('orchestrator') ?? 'manual';
         if (choice === 'langgraph') return langgraph;
         if (choice === 'supervisor') return supervisor;
         if (choice === 'create-agent') return createAgent;
+        if (choice === 'reflexion') return reflexion;
         return manual;
       },
     },

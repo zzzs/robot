@@ -23,6 +23,9 @@
 | [`persistence_roadmap.md`](persistence_roadmap.md) | 从 in-memory 到企业级持久化的路线图 | 想从单机 demo 升级到生产部署时看 |
 | [`enterprise_roadmap.md`](enterprise_roadmap.md) | 存储之外的企业化维度(鉴权/观测/成本/DevOps/合规/安全) | 完成存储升级后,继续做生产化的下一步 |
 | [`postgres_runbook.md`](postgres_runbook.md) | Postgres 维护手册(表含义 + 常用 SQL + 排错 + 危险操作) | 上生产后日常运维、出问题排查时看 |
+| [`reflection_plan_execute.md`](reflection_plan_execute.md) | Reflexion 模式(Plan+Execute+Reflect)原理 + OpenSpec 对照 | 想理解高级 agent 模式何时用时看 |
+| [`agent_ecosystem.md`](agent_ecosystem.md) | Agent 开发生态全景 + 框架对比 + 热门产品架构 + 下一步学什么 | 想了解全局生态、决定学什么时看 |
+| [`codebase_rag_guide.md`](codebase_rag_guide.md) | Codebase RAG 技术选型(代码知识库:tree-sitter + 混合搜索 + 重排序) | 想做项目知识库 / 代码问答系统时看 |
 
 ---
 
@@ -38,6 +41,7 @@
 | `langgraph` | `LangGraphOrchestrator` (`langgraph-orchestrator.ts`) | 手写 StateGraph,生产推荐 |
 | `supervisor` | `SupervisorOrchestrator` (`supervisor-orchestrator.ts`) | supervisor + researcher + summarizer 多 agent |
 | `create-agent` | `CreateAgentOrchestrator` (`create-agent-orchestrator.ts`) | langchain 包 prebuilt `createAgent`,学习对比用 |
+| `reflexion` | `ReflexionOrchestrator` (`reflexion-orchestrator.ts`) | Plan + Execute + Reflect,含 2 个 HITL(plan 确认 + 工具风险确认) |
 
 4 个都实现同一个 `ChatOrchestratorInterface` (`stream` + `resume`),通过 NestJS 工厂 provider 注入到 `ChatService`。详见 `chat.module.ts`。
 
