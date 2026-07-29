@@ -142,6 +142,7 @@ LangChain 提供的"把模型字符串输出解析成结构化数据"的工具�
 - ☐ Self-querying(让 LLM 生成结构化过滤条件)
 - ☐ FLARE (forward-looking active retrieval)
 - ☐ Tree/RAG-Dollar 等高级模式
+- ✅ Codebase RAG(代码知识库)— `codebase/codebase-indexing.service.ts` + `codebase-search.service.ts`,API 触发索引,search_codebase 工具挂到 orchestrator
 
 ---
 

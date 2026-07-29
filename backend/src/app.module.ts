@@ -7,6 +7,7 @@ import { NewsRagModule } from './news/news-rag.module';
 import { EvalModule } from './eval/eval.module';
 import { CaiCompModule } from './cai-comp/cai-comp.module';
 import { PostgresModule } from './postgres/postgres.module';
+import { CodebaseModule } from './codebase/codebase.module';
 
 @Module({
   imports: [
@@ -15,6 +16,7 @@ import { PostgresModule } from './postgres/postgres.module';
     StockModule,
     NewsRagModule,
     CaiCompModule,
+    CodebaseModule,
     ChatModule,
     EvalModule,
   ],

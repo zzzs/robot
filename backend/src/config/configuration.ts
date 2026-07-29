@@ -55,6 +55,11 @@ export default () => ({
     threshold: Number.parseInt(process.env.REFLECTION_THRESHOLD ?? '8', 10),
     maxSteps: Number.parseInt(process.env.PLAN_EXECUTE_MAX_STEPS ?? '5', 10),
   },
+  // Codebase RAG —— 代码知识库
+  // 索引由 API 触发(POST /api/codebase/reindex),不在启动时自动跑
+  codebase: {
+    gitlabToken: process.env.GITLAB_TOKEN ?? '',
+  },
   // 公司组件中心 MCP server 子进程配置。
   // 见 mcp-servers/cai-comp/。Auth 走 5 个 cookie env vars + 3 个 header env vars。
   caiComp: {

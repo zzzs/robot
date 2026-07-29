@@ -15,9 +15,10 @@ import { ReflexionOrchestrator } from './reflexion-orchestrator';
 import { StockModule } from '../stock/stock.module';
 import { NewsRagModule } from '../news/news-rag.module';
 import { CaiCompModule } from '../cai-comp/cai-comp.module';
+import { CodebaseModule } from '../codebase/codebase.module';
 
 @Module({
-  imports: [StockModule, NewsRagModule, CaiCompModule],
+  imports: [StockModule, NewsRagModule, CaiCompModule, CodebaseModule],
   controllers: [ChatController, CacheTestController],
   providers: [
     ChatService,

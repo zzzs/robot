@@ -26,6 +26,9 @@
 | [`reflection_plan_execute.md`](reflection_plan_execute.md) | Reflexion 模式(Plan+Execute+Reflect)原理 + OpenSpec 对照 | 想理解高级 agent 模式何时用时看 |
 | [`agent_ecosystem.md`](agent_ecosystem.md) | Agent 开发生态全景 + 框架对比 + 热门产品架构 + 下一步学什么 | 想了解全局生态、决定学什么时看 |
 | [`codebase_rag_guide.md`](codebase_rag_guide.md) | Codebase RAG 技术选型(代码知识库:tree-sitter + 混合搜索 + 重排序) | 想做项目知识库 / 代码问答系统时看 |
+| [`codebase_rag_cost_reference.md`](codebase_rag_cost_reference.md) | 代码知识库索引耗时 + 存储 + 费用参考表(不同规模) | 评估索引项目的时间和费用时看 |
+| [`llamaindex_vs_langchain_rag.md`](llamaindex_vs_langchain_rag.md) | LlamaIndex.TS vs LangChain RAG 逐维度对比 + 5 个杀手级特性 + 组合方案 | 决定是否引入 LlamaIndex 时看 |
+| [`llamaindex_ecosystem.md`](llamaindex_ecosystem.md) | LlamaIndex 生态全景(5 层能力 / LlamaHub / LlamaParse / LlamaCloud / 接入预览) | 想全面了解 LlamaIndex 能做什么时看 |
 
 ---
 
@@ -88,6 +91,7 @@ Orchestrator.stream() (4 选 1)           ← langgraph-orchestrator.ts
 | `ChatHistoryService` | 会话历史(DATABASE_URL 设了走 Postgres,否则 in-memory) | `chat/chat-history.service.ts` |
 | `SummaryMemoryService` | 长会话压缩,在 ChatHistoryService.getMessages 透明拦截 | `chat/summary-memory.service.ts` |
 | `PostgresModule` | 共享 Postgres Pool + migration runner(全局 module) | `postgres/postgres.module.ts` |
+| `CodebaseModule` | 代码知识库 RAG(LlamaIndex 分块 + pgvector 检索 + search_codebase 工具) | `codebase/codebase.module.ts` |
 | `StockAnalysisService` | 数据源无关的分析编排(可注入 Mcp 或 Sina) | `stock/stock-analysis.service.ts` |
 | `IndicatorService` | 纯函数指标计算 | `stock/indicators/indicator.service.ts` |
 | `SignalDeriver` / `TrendScorer` | 离散信号 + 综合评分 | `stock/analysis/*.ts` |

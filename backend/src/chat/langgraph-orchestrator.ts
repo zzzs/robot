@@ -41,6 +41,7 @@ import {
   CAI_COMP_GET_DETAIL_TOOL,
   CAI_COMP_LIST_TOOL,
 } from '../cai-comp/cai-comp.module';
+import { CODEBASE_SEARCH_TOOL, CODEBASE_LIST_PROJECTS_TOOL } from '../codebase/codebase.module';
 
 /**
  * ───────────────────────────────────────────────────────────────────────────
@@ -109,6 +110,23 @@ const SYSTEM_PROMPT = [
   '## 分析诚信',
   '绝不捏造数据。仅引用工具返回的实际内容。',
   '',
+  '## 代码 + 文档搜索',
+  '- `search_codebase(query, project?)`: 搜索项目代码库 + .md 文档。用户问"某功能在哪实现" / "某组件怎么用" / "业务规则" / "设计文档" / "需求" 时调用。',
+  '- 同时搜代码(.ts/.tsx)和文档(.md),返回结果 metadata.type 区分: `code` 是代码,`markdown` 是文档。',
+  '- markdown chunk 的 metadata.headers 含章节路径(如 Header_1="原子标题组件", Header_2="API"),引用时说明章节。',
+  '- 如果用户提到具体项目名,先调 `list_codebase_projects` 确认项目名,再传 project 参数。',
+  '- 如果用户没指定项目,不传 project,搜全部项目。',
+  '- 返回的 metadata 含 file_path / start_line / end_line / type,引用来源。',
+  '',
+  '## 搜索策略(重要!避免搜一次就放弃)',
+  '- 单次搜索召回有限,**必须搜 2-3 次,用不同关键词**。',
+  '- 第一次没找到就换关键词再搜,不要轻易下"未找到"结论。',
+  '- 关键词变体:中文 + 英文 + 文件名/同义词。',
+  '  例:用户问"本地开发文档" → 搜 ["本地开发文档", "开发指南 getting started", "README 安装"]',
+  '  例:用户问"接口依赖" → 搜 ["接口依赖", "API fetch request", "services 接口"]',
+  '  例:用户问"核心逻辑" → 搜 ["核心逻辑", "实现原理", "主入口 main"]',
+  '- 如果多次搜索都搜不到,如实说"未在已索引内容中找到,建议先索引相关文档"。',
+  
   '## 调用 list_comps / get_comp_detail 后',
   '- `list_comps` 返回的 `data[].id` 可作为 `get_comp_detail` 的入参,组合查询。',
   '- status="unauthorized" → 告诉用户 token 过期,需更新 CAI_*_TOKEN env vars,不要重试。',
@@ -118,7 +136,7 @@ const SYSTEM_PROMPT = [
 
 const NO_DATA_REPLY = 'No data available for analysis';
 const INSUFFICIENT_REPLY = 'Data insufficient for reliable analysis';
-const MAX_ITER = 8;
+const MAX_ITER = 16; // 8 不够:agent 多次搜索代码库会耗完迭代,没轮次写回答
 
 @Injectable()
 export class LangGraphOrchestrator implements ChatOrchestratorInterface {
@@ -141,6 +159,10 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
     private readonly caiCompDetailTool: DynamicStructuredTool,
     @Inject(CAI_COMP_LIST_TOOL)
     private readonly caiCompListTool: DynamicStructuredTool,
+    @Inject(CODEBASE_SEARCH_TOOL)
+    private readonly codebaseSearchTool: DynamicStructuredTool,
+    @Inject(CODEBASE_LIST_PROJECTS_TOOL)
+    private readonly codebaseListProjectsTool: DynamicStructuredTool,
     @Inject(SINA_ANALYSIS_SERVICE)
     private readonly sinaAnalysis: StockAnalysisService,
     @Inject(MCP_ANALYSIS_SERVICE)
@@ -153,6 +175,8 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
       this.searchNewsTool,
       this.caiCompDetailTool,
       this.caiCompListTool,
+      this.codebaseSearchTool,
+      this.codebaseListProjectsTool,
     ]);
 
     // 3️⃣ 定义 agent 节点:调用模型,拿到 AIMessage
@@ -245,6 +269,51 @@ export class LangGraphOrchestrator implements ChatOrchestratorInterface {
               new ToolMessage({
                 tool_call_id: tc.id ?? '',
                 content: `news search error: ${(err as Error).message}`,
+              }),
+            );
+          }
+          continue;
+        }
+
+        // codebase 搜索 —— 直接 invoke
+        if (tc.name === 'search_codebase') {
+          try {
+            const result = (await this.codebaseSearchTool.invoke(
+              (args as { query?: string }).query
+                ? args
+                : { query: contentToString((last as AIMessage).content).slice(0, 200) },
+            )) as string;
+            newMessages.push(
+              new ToolMessage({
+                tool_call_id: tc.id ?? '',
+                content: typeof result === 'string' ? result : JSON.stringify(result),
+              }),
+            );
+          } catch (err) {
+            newMessages.push(
+              new ToolMessage({
+                tool_call_id: tc.id ?? '',
+                content: `codebase search error: ${(err as Error).message}`,
+              }),
+            );
+          }
+          continue;
+        }
+
+        if (tc.name === 'list_codebase_projects') {
+          try {
+            const result = (await this.codebaseListProjectsTool.invoke({})) as string;
+            newMessages.push(
+              new ToolMessage({
+                tool_call_id: tc.id ?? '',
+                content: typeof result === 'string' ? result : JSON.stringify(result),
+              }),
+            );
+          } catch (err) {
+            newMessages.push(
+              new ToolMessage({
+                tool_call_id: tc.id ?? '',
+                content: `list projects error: ${(err as Error).message}`,
               }),
             );
           }

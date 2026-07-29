@@ -36,6 +36,7 @@ import {
   CAI_COMP_GET_DETAIL_TOOL,
   CAI_COMP_LIST_TOOL,
 } from '../cai-comp/cai-comp.module';
+import { CODEBASE_SEARCH_TOOL, CODEBASE_LIST_PROJECTS_TOOL } from '../codebase/codebase.module';
 import { ChatOrchestratorInterface } from './chat.service';
 import { ChatMessageDto } from './dto/chat-message.dto';
 import { ChatStreamEvent } from './chat-stream.types';
@@ -80,8 +81,32 @@ const SYSTEM_PROMPT = [
   '- **analyze_stock_free**: A 股个股技术面分析(新浪 HTTP,免费)',
   '- **analyze_stock**: Tushare 版(fallback)',
   '- **search_news**: 新闻 RAG 检索',
-  '- **list_comps**: 公司组件中心列表',
-  '- **get_comp_detail**: 公司组件详情',
+  '- **list_comps**: 公司组件中心列表(查注册信息:id/name/git URL/committer)',
+  '- **get_comp_detail**: 公司组件详情(查元信息)',
+  '- **list_codebase_projects**: 列出已索引的代码知识库项目名',
+  '- **search_codebase(query, project?)**: 搜索项目代码库 + .md 文档,返回代码/文档片段+文件路径+行号',
+  '',
+  '## 代码 + 文档搜索 vs 组件中心 — 重要区分',
+  '- 用户问"核心逻辑/实现原理/怎么做的/接口依赖/代码结构" → 用 **search_codebase**(搜代码)',
+  '- 用户问"业务规则/需求/设计文档/README" → 用 **search_codebase**(搜 .md,metadata.type=markdown)',
+  '- 用户问"有哪些组件/组件ID/谁提交的/git地址" → 用 **list_comps / get_comp_detail**(查注册信息)',
+  '- 用户问"原子标题组件的核心逻辑" → 先 **list_codebase_projects** 确认项目名,再 **search_codebase** 搜代码',
+  '- 用户问"原子标题组件的业务背景" → 用 **search_codebase**(能同时搜代码 + .md)',
+  '- 用户问"原子标题组件的组件ID" → 用 **list_comps**(查组件中心)',
+  '',
+  '## search_codebase 返回',
+  '- metadata.type: `code`(代码)或 `markdown`(文档)',
+  '- markdown chunk 的 metadata.headers 含章节路径(如 Header_1="原子标题组件", Header_2="API")',
+  '- 引用来源时说明文件路径 + 行号 + 类型(代码/文档)',
+  '',
+  '## 搜索策略(重要!避免搜一次就放弃)',
+  '- 单次搜索召回有限,**必须搜 2-3 次,用不同关键词**。',
+  '- 第一次没找到就换关键词再搜,不要轻易下"未找到"结论。',
+  '- 关键词变体:中文 + 英文 + 文件名/同义词。',
+  '  例:用户问"本地开发文档" → 搜 ["本地开发文档", "开发指南 getting started", "README 安装"]',
+  '  例:用户问"接口依赖" → 搜 ["接口依赖", "API fetch request", "services 接口"]',
+  '  例:用户问"核心逻辑" → 搜 ["核心逻辑", "实现原理", "主入口 main"]',
+  '- 如果多次搜索都搜不到,如实说"未在已索引内容中找到,建议先索引相关文档"。',
   '',
   '## 分析诚信',
   '绝不捏造数据。仅引用工具返回的实际内容。',
@@ -205,6 +230,10 @@ export class ReflexionOrchestrator implements ChatOrchestratorInterface {
     private readonly caiCompDetailTool: DynamicStructuredTool,
     @Inject(CAI_COMP_LIST_TOOL)
     private readonly caiCompListTool: DynamicStructuredTool,
+    @Inject(CODEBASE_SEARCH_TOOL)
+    private readonly codebaseSearchTool: DynamicStructuredTool,
+    @Inject(CODEBASE_LIST_PROJECTS_TOOL)
+    private readonly codebaseListProjectsTool: DynamicStructuredTool,
     @Inject(SINA_ANALYSIS_SERVICE)
     private readonly sinaAnalysis: StockAnalysisService,
     @Inject(MCP_ANALYSIS_SERVICE)
@@ -237,8 +266,22 @@ export class ReflexionOrchestrator implements ChatOrchestratorInterface {
           '  - search_news: toolArgs = { "query": "茅台最近新闻" }',
           '  - get_comp_detail: toolArgs = { "id": 2542 }',
           '  - list_comps: toolArgs = {}(不需要参数)',
+          '  - list_codebase_projects: toolArgs = {}(列出已索引的代码项目)',
+          '  - search_codebase: toolArgs = { "query": "核心逻辑 实现", "project": "原子标题组件" }',
           '纯文本步骤: toolName 留空, toolArgs 留空。',
           '对比/综合类的问题,最后一步应该是纯文本步骤。',
+          '',
+          '## 关键区分',
+          '- 用户问"核心逻辑/实现原理/接口依赖/代码结构" → 用 search_codebase 搜代码(不是 list_comps)',
+          '- 用户问"有哪些组件/组件ID/谁提交的" → 用 list_comps / get_comp_detail',
+          '- 如果不知道项目名,先调 list_codebase_projects 看有哪些项目',
+          '',
+          '## 搜索策略(重要)',
+          '- 单次搜索召回有限,涉及代码/文档检索时,**生成 2-3 个 search_codebase 步骤,用不同关键词**',
+          '- 例:用户问"本地开发文档" → 生成:',
+          '  - search_codebase({ query: "本地开发文档", project: "..." })',
+          '  - search_codebase({ query: "开发指南 getting started", project: "..." })',
+          '  - search_codebase({ query: "README 安装", project: "..." })',
           '不要执行,只规划。输出 plan 工具调用。',
         ].join('\n')),
         ...messagesWithoutSystem,
@@ -503,6 +546,10 @@ export class ReflexionOrchestrator implements ChatOrchestratorInterface {
         return this.searchNewsTool;
       case 'list_comps':
         return this.caiCompListTool;
+      case 'search_codebase':
+        return this.codebaseSearchTool;
+      case 'list_codebase_projects':
+        return this.codebaseListProjectsTool;
       case 'get_comp_detail':
         return this.caiCompDetailTool;
       default:
