@@ -8,54 +8,45 @@ import { ChatAnthropic } from '@langchain/anthropic';
 const logger = new Logger('SubAgent');
 
 /**
- * Sub-agent state schema — 共用 shape(只有 messages 字段)
+ * Sub-agent state schema — V4 扩展(加 _taskId + taskResults 支持 multi-agent)
  *
- * 为什么 subgraph state 只含 messages:
- *   - subgraph 接收父图 messages(用户对话历史 + 上一轮结果)
- *   - 内部 ReAct 循环:agent → tools → agent → ... 都靠 messages 传递(AIMessage / ToolMessage)
- *   - 不需要跨 agent 共享其他 state(不像股票 V1 的 AnalysisContext)
+ * 字段:
+ *   - messages: BaseMessage[](reducer: messagesStateReducer)
+ *   - _taskId: string | undefined(Send 时注入,标识当前是 plan 里哪个 task)
+ *   - taskResults: Record<taskId, BaseMessage>(reducer: merge,被 tagTask 节点写入)
+ *
+ * _taskId 对 sub_agent 透明(agent/tools 节点不读),只有 tagTask 节点用它写 taskResults
  */
 const SubAgentState = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
     default: () => [],
     reducer: messagesStateReducer,
   }),
+  _taskId: Annotation<string | undefined>({
+    default: () => undefined,
+    reducer: (_, next) => next ?? _,
+  }),
+  taskResults: Annotation<Record<string, BaseMessage>>({
+    default: () => ({}),
+    reducer: (prev, next) => ({ ...prev, ...next }),
+  }),
 });
 
-/**
- * buildSubAgent — 通用 sub_agent subgraph 工厂
- *
- * 每个 sub_agent 是一个编译好的 StateGraph 对象(实体),内部结构:
- *
- *   START → agent (LLM bindTools)
- *           ├─ tool_calls? → tools (执行) → agent   (ReAct 循环)
- *           └─ 无 tool_calls → END                  (返父图)
- *
- * 作为父图的 node 嵌入:`addNode('stock_agent', buildSubAgent(...))`
- *
- * 跟手写 inline async function 区别:
- *   - 实体概念:有独立 state schema + 独立节点 + 独立 trace
- *   - 可独立单测:inject partial state → invoke → assert delta
- *   - LangSmith trace 看到嵌套:master → stock_agent (subgraph) → agent/tools (inner)
- *   - subgraphs:true 自动透传内层 events 给外层 stream
- */
+// 处理 _taskId reducer 默认值
+const _ = undefined as unknown as string | undefined;
+
 export function buildSubAgent(opts: {
   model: ChatAnthropic;
   systemPrompt: string;
   tools: DynamicStructuredTool[];
-  maxIterations?: number;
 }) {
   const { model, systemPrompt, tools } = opts;
-  const maxIter = opts.maxIterations ?? 6;
   const boundModel = model.bindTools(tools);
-
-  // 工具 lookup map(按 name)
   const toolMap = new Map<string, DynamicStructuredTool>();
   for (const t of tools) toolMap.set(t.name, t);
 
-  // ─── agent node: LLM 决定调什么工具(或写最终答) ──────────────
   const agentNode = async (state: typeof SubAgentState.State) => {
-    logger.log(`agent node invoked, messages count=${state.messages.length}`);
+    logger.log(`agent node invoked, messages count=${state.messages.length}, taskId=${state._taskId ?? 'none'}`);
     const messagesWithoutSystem = state.messages.filter(
       (m) => !(m instanceof SystemMessage),
     );
@@ -63,27 +54,21 @@ export function buildSubAgent(opts: {
       new SystemMessage(systemPrompt),
       ...messagesWithoutSystem,
     ])) as AIMessage;
-    logger.log(`agent LLM response: tool_calls=${response.tool_calls?.length ?? 0}, content_len=${typeof response.content === 'string' ? response.content.length : Array.isArray(response.content) ? JSON.stringify(response.content).length : 0}`);
+    logger.log(`agent LLM response: tool_calls=${response.tool_calls?.length ?? 0}`);
     return { messages: [response] };
   };
 
-  // ─── tools node: 执行 AIMessage 的 tool_calls ────────────────────
   const toolsNode = async (state: typeof SubAgentState.State) => {
     const last = state.messages[state.messages.length - 1];
-    if (!last) {
-      logger.warn('tools node: no messages in state');
-      return { messages: [] };
-    }
+    if (!last) return { messages: [] };
     const isAI = (last as { _getType?: () => string })._getType?.() === 'ai';
     const tc = (last as { tool_calls?: unknown[] }).tool_calls;
     const tcLen = Array.isArray(tc) ? tc.length : 0;
-    logger.log(`tools node: last type=${last.constructor.name}, isAI=${isAI}, tool_calls=${tcLen}, content_type=${typeof last.content}`);
-    if (!isAI || tcLen === 0) {
-      logger.warn(`tools node: skipping — last is ${last.constructor.name} with ${tcLen} tool_calls`);
-      return { messages: [] };
-    }
-    const lastAI = last as unknown as { tool_calls?: Array<{ id?: string; name?: string; args?: Record<string, unknown> }> };
-    logger.log(`tools node: executing ${tcLen} tool calls: ${lastAI.tool_calls?.map(tc => tc.name).join(', ')}`);
+    if (!isAI || tcLen === 0) return { messages: [] };
+    const lastAI = last as unknown as {
+      tool_calls?: Array<{ id?: string; name?: string; args?: Record<string, unknown> }>;
+    };
+    logger.log(`tools node: executing ${tcLen} tool calls`);
     const newMessages: ToolMessage[] = [];
     for (const tc of lastAI.tool_calls ?? []) {
       const args = (tc.args ?? {}) as Record<string, unknown>;
@@ -109,9 +94,6 @@ export function buildSubAgent(opts: {
     return { messages: newMessages };
   };
 
-  // ─── 条件边:agent(AIMessage)有 tool_calls → tools;无 → END ─────
-  // 不用 instanceof AIMessage(LLM invoke 可能返 AIMessageChunk 子类,
-  // instanceof 检查会失败),用 _getType() === 'ai' 判断 + 看 tool_calls 字段
   const routeAfterAgent = (state: typeof SubAgentState.State) => {
     const last = state.messages[state.messages.length - 1] as
       | { _getType?: () => string; tool_calls?: unknown[] }
@@ -120,21 +102,39 @@ export function buildSubAgent(opts: {
     const isAI = last._getType?.() === 'ai';
     if (!isAI) return END;
     const tc = last.tool_calls;
-    if (Array.isArray(tc) && tc.length > 0) {
-      return 'tools';
-    }
-    return END;
+    if (Array.isArray(tc) && tc.length > 0) return 'tools';
+    // 无 tool_calls → 最终答案,路由到 tagTask(写 taskResults)
+    return 'tagTask';
   };
 
-  // ─── 迭代计数:防止 ReAct 死循环 ────────────────────────────────
-  // 通过给 state 加个 iter 计数器,但为简化,这里靠父图 recursionLimit 兜底
-  // (LangGraph 默认 recursionLimit=25,父图设 12,够 sub_agent 内 5-6 轮 ReAct)
+  /**
+   * tagTask 节点 — V4 新增
+   *
+   * 把最后一条 AIMessage(无 tool_calls,即最终答案)写入 taskResults[_taskId]。
+   * 单 task 模式(Send 没传 _taskId)时不写,直接 END。
+   *
+   * 这个节点是 sub_agent 的"出口",保证 plan-execute 模式下父图能收集到结果。
+   */
+  const tagTaskNode = async (state: typeof SubAgentState.State) => {
+    if (!state._taskId) {
+      // 单 task 模式或非 Send 调用,不写 taskResults
+      return {};
+    }
+    const lastMsg = state.messages[state.messages.length - 1];
+    if (!lastMsg) return {};
+    logger.log(`tagTask: writing taskResults[${state._taskId}]`);
+    return {
+      taskResults: { [state._taskId]: lastMsg },
+    };
+  };
 
   return new StateGraph(SubAgentState)
     .addNode('agent', agentNode)
     .addNode('tools', toolsNode)
+    .addNode('tagTask', tagTaskNode)
     .addEdge(START, 'agent')
     .addConditionalEdges('agent', routeAfterAgent)
     .addEdge('tools', 'agent')
+    .addEdge('tagTask', END)
     .compile();
 }

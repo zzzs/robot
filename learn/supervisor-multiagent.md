@@ -567,3 +567,210 @@ V3 的真正学习点是:
 4. **ReAct 由条件边驱动** — 不用手写 for 循环,`agent → tools`(if tool_calls)`| END`(else) + `tools → agent` 自动循环
 
 V2 的手写 ReAct 适合"我就想要个能跑的快速实现";V3 的 LangGraph subgraph 适合"我要学真正的 multi-agent 架构模式"。
+
+---
+
+## 九、V4 升级(2026-08-04):企业级 Plan-Execute-Aggregate
+
+V3 是"master 单路由",V4 升级为业界标准的 **Plan-and-Execute with Parallel Fan-out** 模式,支持:
+- 单任务(退化为 V3)
+- 多任务并行(无依赖,Send fan-out)
+- 多任务顺序(有依赖,拓扑序)
+- 混合(部分并行 + 部分顺序 + summary_agent 综合终点)
+
+### V4 架构
+
+```
+START → planner (LLM 出 Plan)
+      → planConfirm (HITL interrupt,默认开)
+      → executor (拓扑序 + Send fan-out)
+          ├─ Send(stock_agent)    ─→ executor (回环)
+          ├─ Send(project_agent)  ─→ executor (回环)
+          └─ Send(summary_agent)  ─→ executor (回环)
+      → aggregator (合并 taskResults)
+      → END
+```
+
+### 新增 / 变更节点
+
+| 节点 | 类型 | 作用 |
+|---|---|---|
+| **planner** | LLM + bindTools([planTool]) | 出 Plan(tasks[] + depends_on[]),用 Zod schema 强类型 |
+| **planConfirm** | HITL interrupt | emit `plan` + `interrupt` SSE,等用户 resume |
+| **executor** | no-op node + conditional edges | 算 ready tasks,Send fan-out;无 ready 时路由到 aggregator |
+| **stock_agent** | compiled subgraph(继承 V3) | 3 工具:analyze_stock_free / analyze_stock / search_news |
+| **project_agent** | compiled subgraph(继承 V3) | 4 工具:search_codebase / list_codebase_projects / list_comps / get_comp_detail |
+| **summary_agent** | compiled subgraph(新增,LLM-only) | 无 tools,基于其他 taskResults 做综合总结 |
+| **aggregator** | LLM | 合并 taskResults 成最终回复;单 task / 含 summary_agent 时 passthrough |
+
+### Plan 数据结构
+
+```typescript
+const PlanSchema = z.object({
+  tasks: z.array(z.object({
+    id: z.string(),                              // "t1", "t2"
+    agent: z.enum(['stock_agent', 'project_agent', 'summary_agent']),
+    description: z.string(),                     // 给 agent 的任务描述
+    depends_on: z.array(z.string()),             // 依赖的其他 task id
+  })).min(1).max(5),
+});
+```
+
+### 4 种典型 Plan 场景
+
+#### 场景 A:单 task(退化 V3)
+```
+用户:"分析 300033"
+Plan: [{ id: "t1", agent: "stock_agent", description: "分析 300033 技术面", depends_on: [] }]
+执行:t1 → aggregator(passthrough)
+```
+
+#### 场景 B:并行(无依赖)
+```
+用户:"分析 300033 + 找代码里的股票分析实现"
+Plan: [
+  { id: "t1", agent: "stock_agent", ..., depends_on: [] },
+  { id: "t2", agent: "project_agent", ..., depends_on: [] }
+]
+执行:Send[t1, t2] 并行 → aggregator 合并
+```
+
+#### 场景 C:顺序(有依赖)
+```
+用户:"分析 300033,然后基于趋势找代码"
+Plan: [
+  { id: "t1", agent: "stock_agent", ..., depends_on: [] },
+  { id: "t2", agent: "project_agent", ..., depends_on: ["t1"] }
+]
+执行:Send[t1] → 等完成 → Send[t2](输入含 t1 结果) → aggregator
+```
+
+#### 场景 D:混合(并行 + 顺序 + summary 终点)
+```
+用户:"分析 300033 + 找代码 + 综合给个结论"
+Plan: [
+  { id: "t1", agent: "stock_agent", ..., depends_on: [] },
+  { id: "t2", agent: "project_agent", ..., depends_on: [] },
+  { id: "t3", agent: "summary_agent", ..., depends_on: ["t1", "t2"] }
+]
+执行:Send[t1, t2] 并行 → 等都完成 → Send[t3](输入含 t1+t2 结果) → aggregator(passthrough t3)
+```
+
+### State Schema(V4)
+
+```typescript
+const SupervisorState = Annotation.Root({
+  messages: BaseMessage[] (messagesStateReducer),
+  plan: Plan | null,
+  planConfirmed: boolean | null,
+  taskResults: Record<taskId, BaseMessage | { status:'failed'; error:string }>,
+  finalAnswer: string,
+});
+```
+
+### LangGraph `Send` API(并行 fan-out 核心机制)
+
+executor 节点是 no-op state 节点,实际路由靠 conditional edges:
+
+```typescript
+const routeAfterExecutor = (state) => {
+  const readyTasks = findReadyTasks(state.plan.tasks, state.taskResults);
+  if (readyTasks.length === 0) return 'aggregator';
+  // 返 Send[] 让 LangGraph 并行调度
+  return readyTasks.map(task => new Send(task.agent, {
+    messages: buildTaskInputMessages(userQuestion, task, state.taskResults),
+    _taskId: task.id,
+  }));
+};
+
+graph.addConditionalEdges('executor', routeAfterExecutor);
+```
+
+每个 sub_agent subgraph 执行完后,通过 `addEdge('stock_agent', 'executor')` 回到 executor,executor 重新计算 ready,继续下一批。
+
+### sub_agent 兼容 V3 + 新增 tagTask 节点
+
+V3 的 sub_agent subgraph 是 `agent → tools → agent → ... → END`。V4 加了 `tagTask` 节点:
+
+```
+START → agent
+        ├─ tool_calls? → tools → agent   (ReAct 循环)
+        └─ 无 tool_calls → tagTask → END  (写 taskResults[_taskId])
+```
+
+`tagTask` 节点读 state.`_taskId`(由 Send 注入),把最后一条 AIMessage 写入 `taskResults[_taskId]`。单 task 模式(_taskId 未设)时不写。
+
+### HITL interrupt + Resume
+
+```typescript
+// planConfirm 节点
+const planConfirmNode = (state) => {
+  if (state.planConfirmed === true) return {};
+  if (!planHitlEnabled) return { planConfirmed: true };
+  // interrupt() 暂停 graph,等用户 resume
+  const userAction = interrupt({
+    reason: `请确认 plan:\n${formatPlan(state.plan)}`,
+    confirmLabel: 'Plan 没问题,开始执行',
+    cancelLabel: '取消',
+  });
+  return { planConfirmed: userAction !== 'cancelled' };
+};
+```
+
+Resume 通过 `/api/chat/resume?action=confirm|cancel`,后端用 `Command({ resume: 'confirmed' | 'cancelled' })` 触发 graph 继续执行。
+
+### V4 e2e 验证(2026-08-04,关 HyDE+Rewrite)
+
+```
+✅ Planner:生成 Plan(单 task project_agent)
+✅ HITL:plan + interrupt SSE 事件正确 emit
+✅ Resume:用户 confirm 后 graph 恢复,planConfirmed=true
+✅ Executor:Send fan-out t1 → project_agent subgraph
+✅ Sub_agent ReAct:agent → search_codebase → agent → ... → tagTask
+✅ Token streaming:token 流到 SSE(subgraphs:true 已知有重复)
+✅ Aggregator:passthrough 单 task 结果
+```
+
+### 业界 multi-agent 实现对比
+
+| 维度 | **本项目 V4** | LangGraph 官方 Plan-Execute | AutoGen GroupChat | CrewAI Hierarchical | OpenAI Swarm | MetaGPT |
+|---|---|---|---|---|---|---|
+| 范式 | Plan + Send fan-out + Aggregate | Plan + Execute(教程版) | 对话式 | 角色 + Process | handoff 函数 | SOP + 角色 |
+| Plan 数据结构 | Zod schema 强类型 | Zod schema | 无显式 plan | Process 描述 | 无 | SOP 文档 |
+| HITL Plan 确认 | ✅ interrupt(默认开) | ✅ tutorial 有 | ⚠️ user_proxy | ⚠️ 弱 | ❌ | ❌ |
+| 并行 fan-out | ✅ LangGraph Send API | ✅ | ⚠️(Manager 调度,非真正并行) | ⚠️ sequential only by default | ❌ | ❌(Pipeline 顺序) |
+| 顺序(依赖) | ✅ depends_on + 拓扑序 | ✅ | ❌ | ✅ sequential process | ❌ | ✅ SOP |
+| 失败隔离 | ✅ 单 task 失败不阻塞 | ⚠️ | ✅ | ⚠️ | ❌ | ⚠️ |
+| 结果聚合 | ✅ LLM Aggregator | ✅ | Manager 聚合 | LLM 聚合 | ❌ | 共享文档 |
+| 角色化 prompt | 🟡(prompt 自由) | ❌ | ❌ | ✅ role/goal/backstory | ❌ | ✅ |
+| 生产就绪 | ✅ | ✅ | 🟡 | 🟡 | ❌ 实验 | 🟡 |
+| 适合 | 通用任务路由 + 多步协作 | 教学 | 多 agent 对话/辩论 | 角色化团队 | 概念验证 | 软件研发流程 |
+
+**本项目 V4 跟 LangGraph 官方 Plan-Execute tutorial 思路一致**(因为都是基于 LangGraph Send API),但加了:
+- ✅ HITL Plan 确认(默认开,生产可关)
+- ✅ 3 个领域 sub_agent(stock / project / summary)
+- ✅ 失败隔离(单 task 失败不阻塞)
+- ✅ 单 task 退化(简单问题不走 plan-execute 全套)
+- ✅ Aggregator 智能合并(单 task / 含 summary 时 passthrough)
+
+### V4 学习价值
+
+V4 涵盖了企业级 multi-agent 的所有核心要素:
+1. **Plan-and-Execute 模式**(Planner LLM + Executor 调度)
+2. **DAG 任务图**(depends_on + 拓扑序)
+3. **并行 fan-out**(LangGraph `Send` API)
+4. **顺序执行**(依赖链)
+5. **HITL Plan 确认**(interrupt + Command resume)
+6. **结果聚合**(LLM Aggregator + passthrough 优化)
+7. **失败隔离**(单 task 失败不阻塞)
+8. **sub_agent 实体**(compiled subgraph,可独立测试)
+9. **可观测**(LangSmith trace 看 Plan → fan-out → 各 sub_agent → Aggregator 全链路)
+10. **生产可关 HITL**(SUPERVISOR_PLAN_HITL_ENABLED=false 直通)
+
+### V5 候选(未实现)
+
+- **Replan**:执行中发现 plan 不够,触发重新规划(类似 Reflexion 的 reflect)
+- **Streaming 优化**:解决 subgraphs:true 的 token 重复问题
+- **Plan 编辑**:HITL 时用户可改 plan(不只 confirm/cancel)
+- **并行工具调用**:sub_agent 内多工具并发(目前 LangGraph 默认是顺序)
+- **跨 agent 状态共享**:目前 taskResults 隔离,加 shared scratchpad

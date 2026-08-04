@@ -88,3 +88,60 @@
   - subgraph 实体概念(独立 schema + 独立测试 + 嵌套 trace)
   - 代码位置:`subgraphs/stock-agent.subgraph.ts` / `subgraphs/project-agent.subgraph.ts`
   - 内部结构图(START → agent → tools → agent → ... → END)
+
+## 8. V4 — summary_agent subgraph 实现
+
+- [x] 8.1 新建 `backend/src/chat/subgraphs/summary-agent.subgraph.ts`:`buildSummaryAgentSubgraph(model)`,LLM-only subgraph(无 tools),systemPrompt 是"基于其他 agent 结果综合总结"
+- [x] 8.2 summary_agent state 沿用 SubAgentState(messages only)
+- [x] 8.3 summary_agent prompt:输入是其他 taskResults 拼成的 messages + 用户原问题,输出综合总结
+
+## 9. V4 — Planner + Plan HITL 实现
+
+- [x] 9.1 新建 `backend/src/chat/supervisor-planner.ts`:`PlanSchema`(Zod)+ `PLANNER_SYSTEM_PROMPT`
+- [x] 9.2 `PLANNER_SYSTEM_PROMPT` 说明:把用户问题拆 1-5 个 tasks,有依赖加 depends_on,涉及总结用 summary_agent
+- [x] 9.3 planner 节点:用 `bindTools([planTool])` 调 LLM,返 Plan
+- [x] 9.4 planConfirm 节点:`SUPERVISOR_PLAN_HITL_ENABLED` 默认 true,用 LangGraph `interrupt` 暂停,等 `/api/chat/resume?action=confirm|cancel`
+- [x] 9.5 SSE 加 `plan` + `plan-confirm` 事件类型
+- [x] 9.6 ChatController `/api/chat/resume` 复用(Reflexion 已有),支持 supervisor 模式的 plan 确认
+
+## 10. V4 — Executor(拓扑序 + Send fan-out)
+
+- [x] 10.1 新建 `backend/src/chat/supervisor-executor.ts`:topoSort(plan) 函数 + executor 节点
+- [x] 10.2 检测循环依赖,有环抛 CirculationError
+- [x] 10.3 用 LangGraph `Send` API fan-out:对每个 ready task,`new Send(subgraph_name, { messages, _taskId })`
+- [x] 10.4 收集 Send 结果:从各实例 final state 提取最后 AIMessage,写入父图 `taskResults[taskId]`
+- [x] 10.5 多批执行:第一批完成后,重新计算 ready tasks,继续 Send
+- [x] 10.6 失败隔离:sub_agent throw 时,taskResults[taskId] = `{ status: 'failed', error: msg }`,继续其他 task
+
+## 11. V4 — Aggregator
+
+- [x] 11.1 新建 `backend/src/chat/supervisor-aggregator.ts`:`AGGREGATOR_SYSTEM_PROMPT` + aggregator 节点
+- [x] 11.2 prompt:输入是用户原问题 + 所有 taskResults,输出综合中文回复
+- [x] 11.3 单 task 时 passthrough(不调 LLM)
+- [x] 11.4 含 summary_agent 结果时 passthrough(summary_agent 已综合)
+- [x] 11.5 含失败 task 时,在回复中说明失败原因
+
+## 12. V4 — 重构 supervisor-orchestrator.ts 拓扑
+
+- [x] 12.1 新拓扑:`START → planner → planConfirm → executor → aggregator → END`
+- [x] 12.2 删 V3 的 master node(被 planner + planConfirm 替代)
+- [x] 12.3 3 个 sub_agent 作为 compiled subgraph,executor 内 Send 调度
+- [x] 12.4 State 扩展:`plan / planConfirmed / taskResults / finalAnswer`
+- [x] 12.5 SSE stream loop 加 `plan` / `plan-confirm` 事件转发
+- [x] 12.6 关闭 V3 的 `nextDecision` state field(被 plan 替代)
+
+## 13. V4 — 验证(HyDE/Rewrite 关省成本)
+
+- [x] 13.1 设 `CODEBASE_HYDE_ENABLED=false` + `CODEBASE_QUERY_REWRITE_ENABLED=false`(memory 要求)
+- [x] 13.2 `npm run build` + `npm test` 通过
+- [x] 13.3 e2e 单 task:"分析 300033" → planner 出 1 task → HITL 确认 → stock_agent → aggregator passthrough → END
+- [x] 13.4 e2e 并行:"分析 300033 + 找代码里股票分析实现" → planner 出 t1+t2 无依赖 → HITL → Send fan-out → aggregator 合并
+- [x] 13.5 e2e 顺序:"分析 300033 然后基于趋势找代码" → planner 出 t1→t2 依赖 → HITL → t1 → t2 → aggregator
+- [x] 13.6 e2e 混合:"分析 300033 + 找代码 + 综合给结论" → planner 出 t1+t2 ‖ t3(summary) → HITL → 并行 t1+t2 → 顺序 t3 → aggregator passthrough t3
+- [x] 13.7 e2e 取消 plan:HITL 弹出后调 resume?action=cancel → END + "已取消"
+- [x] 13.8 e2e 失败隔离:mock t1 失败 → t2 继续完成 → aggregator 说明失败
+
+## 14. V4 — 文档 + 业界对比
+
+- [x] 14.1 `learn/supervisor-multiagent.md` 加 V4 章节(Plan-Execute-Aggregate 架构 + DAG + Send fan-out + 失败隔离)
+- [x] 14.2 `learn/supervisor-multiagent.md` 加业界对比章节(LangGraph Plan-and-Execute vs AutoGen GroupChat vs CrewAI Hierarchical vs OpenAI Swarm vs MetaGPT SOP)
