@@ -1,6 +1,47 @@
 # Supervisor Multi-Agent 编排器
 
-> 本文记录 robot 项目 `SupervisorOrchestrator` 的实现演进,以及市面上不同 supervisor 实现 / 不同路由维度的对比。适合学习 multi-agent 架构时查阅。
+> 本文记录 robot 项目 `SupervisorOrchestrator` 的实现演进 + 业界对比 + 通用 API 速查。适合学习 multi-agent 架构时查阅。
+
+---
+
+## 零、为什么要从单 agent 升级到 supervisor 多 agent
+
+在 `langgraph` 模式下(单 agent),一个 LLM 同时承担**多个职责**:
+
+1. **决定**用户问的是不是股票问题(routing)
+2. **拉取数据**+ 计算指标(research)
+3. **写中文总结**+ 应用诚信规则(summarize)
+
+把多件事塞进一个 system prompt 的问题:
+- prompt 越长越脆,改一处怕影响另一处
+- 加新数据源(新闻、基本面)只能继续往 prompt 里加条款
+- LangSmith trace 是扁平的,看不到"决策 vs 执行"的分界
+
+**Supervisor 模式的核心思想:** 把每个职责交给一个**专精 agent**,用 supervisor/master/planner 做总调度。
+
+**升级后的优势(贯穿 V1-V4)**:
+
+| 维度 | 单 agent (langgraph) | Supervisor 多 agent |
+|---|---|---|
+| LLM 调用数(简单问题) | 1-2 | 2-4(多 1-2 次路由) |
+| LLM 调用数(多步问题) | 5-10(都在一个 prompt 里) | 同等(但每步独立 prompt) |
+| System prompt 数量 | 1 个大 prompt | N 个专精 prompt(每个 sub_agent 一个) |
+| 数据/总结的耦合度 | 高(同一 prompt) | 低(via state 投影) |
+| 可观测性 | 扁平 trace | 嵌套 trace,每步独立 |
+| 加新数据源 | 改 prompt + 改工具 | 加一个新 subgraph,planner 多个 enum 值 |
+| 测试隔离 | 难(整体) | 易(每个 subgraph 独立单测) |
+
+**何时用 supervisor 模式?**
+- ✅ 有多个数据源(K线 / 新闻 / 代码库 / 组件)
+- ✅ 需要 HITL(每个 subgraph 可以独立 interrupt)
+- ✅ 团队多人协作(不同人负责不同 agent)
+- ✅ 想要清晰的 trace 用于 debug
+- ✅ 任务可拆分(并行 / 顺序 / 综合)
+
+**何时还用单 agent?**
+- ✅ 只有一个数据源
+- ✅ 追求最低 token 成本
+- ✅ 简单的"调工具 + 写回复"场景
 
 ---
 
@@ -774,3 +815,386 @@ V4 涵盖了企业级 multi-agent 的所有核心要素:
 - **Plan 编辑**:HITL 时用户可改 plan(不只 confirm/cancel)
 - **并行工具调用**:sub_agent 内多工具并发(目前 LangGraph 默认是顺序)
 - **跨 agent 状态共享**:目前 taskResults 隔离,加 shared scratchpad
+
+---
+
+## 十、通用 LangGraph API 速查(贯穿 V1-V4)
+
+无论 supervisor 哪个版本,这些 LangGraph API 都是核心。
+
+### 1. StateGraph + Annotation.Root(状态定义)
+
+```typescript
+import { Annotation, StateGraph, START, END } from '@langchain/langgraph';
+import { messagesStateReducer } from '@langchain/langgraph';
+
+const MyState = Annotation.Root({
+  messages: Annotation<BaseMessage[]>({
+    default: () => [],
+    reducer: messagesStateReducer,  // 智能合并(同 id 替换,否则追加)
+  }),
+  counter: Annotation<number>({
+    default: () => 0,
+    reducer: (prev, next) => prev + next,  // 累加
+  }),
+  results: Annotation<string[]>({
+    default: () => [],
+    reducer: (prev, next) => [...prev, ...next],  // 追加
+  }),
+  decision: Annotation<string>({
+    default: () => '',
+    reducer: (_, next) => next,  // last-write-wins
+  }),
+});
+
+const graph = new StateGraph(MyState)
+  .addNode(...)
+  .addEdge(START, 'node1')
+  .compile();
+```
+
+**reducer 选择**:
+- `messagesStateReducer`:messages 数组(按 id 去重)
+- `(prev, next) => next`:last-write-wins(单一值)
+- `(prev, next) => [...prev, ...next]`:累加(列表)
+- `(prev, next) => ({ ...prev, ...next })`:对象合并
+- 自定义:任意逻辑(过滤、聚合)
+
+### 2. Subgraph 嵌入(模块化 + 嵌套 trace)
+
+```typescript
+// 子图:编译好的 StateGraph 对象
+const subgraph = new StateGraph(SubState)
+  .addNode('agent', agentNode)
+  .addNode('tools', toolsNode)
+  .addEdge(START, 'agent')
+  .addConditionalEdges('agent', routeFn)
+  .addEdge('tools', 'agent')
+  .compile();
+
+// 嵌入父图作为节点(直接传 compiled graph)
+const parentGraph = new StateGraph(ParentState)
+  .addNode('mySub', subgraph)   // ← 整个子图当一个节点
+  .compile();
+```
+
+**Subgraph vs 普通函数**:
+
+| 用函数 | 用 subgraph |
+|---|---|
+| LangSmith trace 是扁平的 LLM/tool run | LangSmith trace 是**嵌套的子图**,可单独展开 |
+| 不能有自己的内部节点/边 | 可以有自己的状态机(条件边、循环) |
+| 单元测试要 mock 整个父图 | 可以**独立单测**,只 mock 自己的依赖 |
+| 状态共享靠参数传递 | 状态自动投影(同名字段互通) |
+
+### 3. withStructuredOutput / bindTools(结构化路由 + 工具调用)
+
+```typescript
+import { z } from 'zod';
+
+// 方式 A:withStructuredOutput(强制 LLM 返满足 schema 的对象)
+const RouteSchema = z.object({
+  next: z.enum(['researcher', 'summarizer', 'end']),
+});
+const router = model.withStructuredOutput(RouteSchema);
+const result = await router.invoke([new HumanMessage('...')]);
+result.next;  // 'researcher' | 'summarizer' | 'end' — TS 已知类型
+
+// 方式 B:bindTools(LLM 自主决定是否 emit tool_call)
+const tool = new DynamicStructuredTool({
+  name: 'plan',
+  description: 'Generate a plan',
+  schema: PlanSchema,
+  func: (input) => Promise.resolve(JSON.stringify(input)),
+});
+const modelWithTools = model.bindTools([tool]);
+const response = await modelWithTools.invoke([...]);
+response.tool_calls;  // [{ name: 'plan', args: {...} }] 或 []
+```
+
+**Aliyun 网关坑**:withStructuredOutput 在 Aliyun Anthropic 兼容网关下不工作(网关丢了 tool_choice 强制参数),要用 bindTools 替代。本项目 V3/V4 都用 bindTools。
+
+### 4. Conditional Edges(条件路由 + Send fan-out)
+
+```typescript
+// 单路由(返字符串):
+graph.addConditionalEdges('agent', (state) =>
+  state.hasToolCalls ? 'tools' : END
+);
+
+// 多路由(返字符串数组,LangGraph 同时调度):
+graph.addConditionalEdges('fanout', (state) =>
+  ['node1', 'node2', 'node3']
+);
+
+// Send fan-out(返 Send 数组,带独立 inputState):
+import { Send } from '@langchain/langgraph';
+graph.addConditionalEdges('executor', (state) => {
+  if (state.done) return 'aggregator';
+  return state.readyTasks.map(t =>
+    new Send(t.agent, { messages: [...], _taskId: t.id })
+  );
+});
+
+// 显式 pathMap(限定返回值):
+graph.addConditionalEdges(
+  'supervisor',
+  (state) => state.next,
+  { researcher: 'researcher', summarizer: 'summarizer', end: END },
+);
+```
+
+### 5. interrupt + Command HITL(人工审核)
+
+```typescript
+import { interrupt, Command } from '@langchain/langgraph';
+
+// 节点内 interrupt:
+const confirmNode = (state) => {
+  if (state.confirmed) return {};
+  const userAction = interrupt({
+    reason: '请确认是否执行',
+    options: ['ok', 'cancel'],
+  });
+  return { confirmed: userAction !== 'cancel' };
+};
+
+// 外部恢复(用户点确认):
+const stream = await compiled.stream(
+  new Command({ resume: 'ok' }),
+  { configurable: { thread_id: sessionId } }
+);
+```
+
+**关键**:HITL 必须配 checkpointer,否则状态丢失。
+
+### 6. Checkpointer(状态持久化)
+
+```typescript
+import { PostgresSaver } from '@langchain/langgraph-checkpoint-postgres';
+import { MemorySaver } from '@langchain/langgraph';
+
+// 生产:Postgres
+const checkpointer = PostgresSaver.fromConnString(process.env.DATABASE_URL);
+await checkpointer.setup();
+
+// 开发:内存(重启丢)
+const checkpointer = new MemorySaver();
+
+const graph = new StateGraph(State)
+  .addNode(...)
+  .compile({ checkpointer });
+
+// 调用时按 thread_id 隔离:
+await graph.stream(input, {
+  configurable: { thread_id: sessionId },
+});
+```
+
+### 7. streamMode 多模式 + subgraphs:true
+
+```typescript
+const stream = await compiled.stream(input, {
+  streamMode: ['values', 'updates', 'messages', 'custom', 'debug'],
+  subgraphs: true,  // ← subgraph 内部事件透传到外层
+});
+
+for await (const chunk of stream) {
+  // subgraphs:true 下 chunk 可能是 [mode, payload] 或 [namespacePath, mode, payload]
+  const arr = chunk as unknown[];
+  let mode: string, payload: unknown, nsPath: string | undefined;
+  if (arr.length === 3 && Array.isArray(arr[0])) {
+    nsPath = (arr[0] as unknown[]).join(':');
+    mode = arr[1] as string;
+    payload = arr[2];
+  } else {
+    mode = arr[0] as string;
+    payload = arr[1];
+  }
+  // 处理...
+}
+```
+
+| streamMode | 输出 | 用途 |
+|---|---|---|
+| `values` | 每步完整 state | 看 state 演化 |
+| `updates` | 每节点的 delta | 看节点输出 |
+| `messages` | LLM token chunks | 前端流式显示 |
+| `custom` | writer.write 触发 | 工具进度、自定义事件 |
+| `debug` | 任务/节点元信息 | 调试 |
+
+### 8. Annotation 跨 subgraph 投影
+
+父图跟 subgraph 同名字段自动互通:
+
+```typescript
+// 父图:
+const ParentState = Annotation.Root({
+  messages: ...,
+  taskResults: ...,
+});
+
+// subgraph:
+const SubState = Annotation.Root({
+  messages: ...,    // ← 跟父图同名字段自动投影
+  _taskId: ...,     // ← Send 注入的私有字段
+  taskResults: ..., // ← 写回父图
+});
+
+// Send 时:
+new Send('mySub', { messages: [...], _taskId: 't1' });
+// → subgraph 收到 messages + _taskId
+// → subgraph 写 taskResults → 自动合并到父图 taskResults(同名字段)
+```
+
+---
+
+## 十一、V1 时代的 AnalysisContext 概念(已废弃但值得学)
+
+V1 的 researcher 跟 summarizer 通过 `AnalysisContext` 强类型契约通信:
+
+```typescript
+interface AnalysisContext {
+  status: 'pending' | 'ok' | 'no-data' | 'insufficient';
+  symbol?: string;
+  trend?: { direction: 'bullish'|'bearish'|'neutral'; score: number; confidence: number };
+  signals?: Signal[];
+  latest_bar?: Bar;
+  integrityReply?: string;  // 'No data available for analysis' 等
+}
+```
+
+**为什么有这个抽象**:researcher 拿到的是完整 `AnalysisResult`(90 根 K 线 OHLCV + 完整指标数列,token 爆炸),summarizer 只需要看**结构化结论**(方向、信号、置信度,几百 token)。
+
+**V2+ 现状**:researcher/summarizer 合并成 stock_agent 单 LLM,AnalysisContext 不再用。但概念有价值 — 跨 agent 数据传递时,**投影成结构化小对象 > 透传原始大数据**,省 token + 清晰。
+
+V4 的等价物:executor 给下游 task 传 input messages 时,只传上游 taskResults 的 content 字符串(已经过 LLM 总结),不传原始工具返回(可能含 90 根 K 线 JSON)。
+
+---
+
+## 十二、LangSmith trace 嵌套示例(V4)
+
+跑 "分析 300033 + 找代码里的实现" 的 trace 结构:
+
+```
+StateGraph (SupervisorOrchestrator V4)
+├─ planner (LLM, bindTools([planTool]))
+│  └─ emit tool_call {tasks: [t1, t2]}
+├─ planConfirm (HITL interrupt)
+│  └─ user resume: 'confirmed'
+├─ executor (no-op, conditional edges)
+│  ├─ Send(stock_agent, {messages, _taskId:'t1'})
+│  └─ Send(project_agent, {messages, _taskId:'t2'})
+│     │
+│     ├─ stock_agent (StateGraph subgraph)
+│     │  ├─ agent (LLM, bindTools 3 个 stock 工具)
+│     │  │  └─ emit tool_call analyze_stock_free({ts_code:'300033'})
+│     │  ├─ tools (执行 analyze_stock_free → 返 K 线 + 指标)
+│     │  ├─ agent (LLM,基于结果写总结)
+│     │  └─ tagTask (写 taskResults[t1] = AIMessage)
+│     │
+│     └─ project_agent (StateGraph subgraph)
+│        ├─ agent (LLM, bindTools 4 个 project 工具)
+│        │  └─ emit tool_call search_codebase({query:'股票分析'})
+│        ├─ tools (执行,触发 CodebaseSearchService 三波 RAG)
+│        ├─ agent (LLM,基于结果再搜或写答)
+│        ├─ ... 多轮 ReAct ...
+│        └─ tagTask (写 taskResults[t2] = AIMessage)
+│
+├─ executor (第 2 轮,无 ready tasks)
+│  └─ route to 'aggregator'
+├─ aggregator (LLM,合并 taskResults[t1] + taskResults[t2])
+│  └─ 写 finalAnswer
+└─ END
+```
+
+**对比单 agent 的扁平 trace**:你能清楚看到"plan → fan-out 并行执行 → 聚合"的层级,这是 multi-agent 最大的可观测性优势。
+
+---
+
+## 十三、测试用例(V4)
+
+```bash
+# 在 backend/.env 设
+ORCHESTRATOR=supervisor
+SUPERVISOR_PLAN_HITL_ENABLED=true   # 默认开,生产可关
+
+# 重启后端
+cd backend && npm run start:dev
+```
+
+**测试矩阵**:
+
+| 输入 | 期望 plan | 期望执行 |
+|---|---|---|
+| `分析一下 300033` | 1 task stock_agent | 单 task 路径,aggregator passthrough |
+| `原子标题组件的核心逻辑是什么` | 1 task project_agent | 单 task 路径 |
+| `分析 300033 + 找代码里的股票分析实现` | 2 task(无依赖) | 并行 fan-out |
+| `先分析 300033,再基于趋势找代码` | 2 task(有依赖) | 顺序执行 |
+| `分析 300033 + 找代码 + 综合给结论` | 3 task(2 并行 + summary) | 混合执行 |
+| `你好` | 1 task project_agent | 单 task,project_agent 直接答 |
+
+**日志关键词验证**:
+
+```bash
+# Plan 生成
+grep "planner generated" backend.log
+
+# Send fan-out(并行)
+grep "executor: fan-out" backend.log
+
+# 顺序依赖
+grep "depends_on=1\|depends_on=2" backend.log
+
+# 单 task passthrough
+grep "single task passthrough" backend.log
+
+# summary_agent 综合
+grep "passthrough summary_agent" backend.log
+```
+
+---
+
+## 十四、本版本(V4)没做的事(留给 V5)
+
+1. **Replan** — 执行中发现 plan 不够,触发重新规划(类似 Reflexion 的 reflect)
+2. **Streaming 优化** — 解决 subgraphs:true 的 token 重复 + LangSmith tracer `No tool run to end` 警告
+3. **Plan 编辑** — HITL 时用户可改 plan(不只 confirm/cancel)
+4. **并行工具调用** — sub_agent 内多工具并发(目前 LangGraph 默认顺序)
+5. **跨 agent 状态共享** — 目前 taskResults 隔离,加 shared scratchpad
+6. **Per-task timeout** — 单 task 卡住时不阻塞其他 task(BSP barrier 当前等所有)
+7. **Token 优化** — planner / aggregator 用小模型,sub_agent 内 ReAct 用大模型
+
+---
+
+## 十五、参考资源
+
+### 论文
+- **AutoGen**: Wu et al., 2023 — AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation
+- **MetaGPT**: Hong et al., 2023 — Meta Programming for Multi-Agent Collaborative Framework
+- **CAMEL**: Li et al., 2023 — Role-playing 双 agent 协作
+- **Generative Agents**: Park et al., 2023 — 25 个 AI agent 模拟小镇
+- **MultiAgent Debate**: Du et al., 2023 — 多 LLM 辩论降幻觉
+- **Mixture-of-Agents**: Together AI, 2024 — 多 LLM 聚合
+
+### 文档/教程
+- **LangGraph Multi-Agent**: https://langchain-ai.github.io/langgraph/tutorials/multi_agent/
+- **LangGraph Supervisor Package**: https://github.com/langchain-ai/langgraph-supervisor
+- **LangGraph Plan-and-Execute**: https://langchain-ai.github.io/langgraph/tutorials/multi_agent/plan-and-execute/
+- **CrewAI Docs**: https://docs.crewai.com/
+- **OpenAI Swarm**: https://github.com/openai/swarm(实验性)
+- **Anthropic Building Effective Agents**: https://www.anthropic.com/research/building-effective-agents
+
+### 本项目代码
+- `backend/src/chat/supervisor-orchestrator.ts` — V4 父图(planner + planConfirm + executor + aggregator)
+- `backend/src/chat/supervisor-planner.ts` — PlanSchema + planner 节点
+- `backend/src/chat/supervisor-executor.ts` — 拓扑序 + Send fan-out
+- `backend/src/chat/supervisor-aggregator.ts` — 结果聚合
+- `backend/src/chat/subgraphs/sub-agent.subgraph.ts` — 通用 sub_agent 工厂
+- `backend/src/chat/subgraphs/stock-agent.subgraph.ts` — 股票域
+- `backend/src/chat/subgraphs/project-agent.subgraph.ts` — 项目域
+- `backend/src/chat/subgraphs/summary-agent.subgraph.ts` — 综合总结域
+
+### OpenSpec 提案
+- V4:`openspec/changes/add-enterprise-multiagent/`
+- V1 归档:`openspec/changes/archive/2026-06-30-add-supervisor-multiagent/`

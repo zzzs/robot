@@ -67,10 +67,8 @@ export function hasCircularDependency(
 /**
  * 把 taskResults 拼成 messages 列表,作为下游 task 的输入
  *
- * @param userQuestion 用户原问题
- * @param task 当前要执行的 task
- * @param taskResults 已完成 task 的结果(taskId → AIMessage)
- * @returns messages 数组,作为下游 sub_agent subgraph 的输入
+ * 关键:明确告诉 sub_agent "只回答你这一部分,其他由别的 agent 处理",
+ * 防止 stock_agent 看到完整用户问题(含 project 部分)就尝试回答超纲内容
  */
 export function buildTaskInputMessages(
   userQuestion: string,
@@ -79,14 +77,17 @@ export function buildTaskInputMessages(
 ): BaseMessage[] {
   const messages: BaseMessage[] = [];
 
-  // 用户原问题作为第一条 HumanMessage(让 sub_agent 知道上下文)
-  messages.push(new HumanMessage(userQuestion.slice(0, 300)));
+  // 1. 用户原问题(标明"仅作上下文,不要回答全部")
+  messages.push(
+    new HumanMessage(
+      `[用户原问题(仅作上下文,你只需回答你的任务部分)]\n${userQuestion.slice(0, 300)}`,
+    ),
+  );
 
-  // 拼接依赖的 task 结果
+  // 2. 拼接依赖的 task 结果(顺序 task 时,前置结果作为参考)
   for (const depId of task.depends_on) {
     const result = taskResults[depId];
     if (!result) continue;
-    const depTask = task.description; // 仅日志用
     const content =
       'content' in result
         ? typeof result.content === 'string'
@@ -95,14 +96,16 @@ export function buildTaskInputMessages(
         : `FAILED: ${result.error}`;
     messages.push(
       new HumanMessage(
-        `[依赖 task ${depId} 结果]\n${typeof content === 'string' ? content.slice(0, 1000) : '[non-string content]'}`,
+        `[依赖 task ${depId} 结果(参考)]\n${typeof content === 'string' ? content.slice(0, 1000) : '[non-string content]'}`,
       ),
     );
   }
 
-  // 当前 task 的描述作为最后一条 HumanMessage(让 sub_agent 知道要做什么)
+  // 3. 当前 task 描述(明确"只回答这个,其他别管")
   messages.push(
-    new HumanMessage(`[当前任务 ${task.id}] ${task.description}`),
+    new HumanMessage(
+      `[你的任务 ${task.id} — 只回答这个,不要回答用户原问题里的其他部分]\n${task.description}`,
+    ),
   );
 
   return messages;

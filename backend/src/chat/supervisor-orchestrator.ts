@@ -304,6 +304,29 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
   ): AsyncGenerator<ChatStreamEvent> {
     let finalText = '';
     const seenNodes = new Set<string>();
+    // 内容级去重:subgraphs:true 下同一 chunk 在多层 nsPath 冒泡(parent/subgraph/inner),
+    // 导致 SSE 消费者看到 2-3x 重复 token。100ms 内同内容视为重复冒泡,跳过
+    // (subgraphs:true 多层冒泡时间差通常 < 50ms,100ms 足够;短窗口避免误杀
+    // 合法的连续相同 token 如 markdown "## " 等)
+    const recentTextTs = new Map<string, number>();
+    const DEDUP_WINDOW_MS = 100;
+    const MAX_RECENT_ENTRIES = 200;  // 防内存无限增长
+    const tryForwardText = (text: string): boolean => {
+      if (!text) return false;
+      const now = Date.now();
+      const lastTs = recentTextTs.get(text);
+      if (lastTs !== undefined && now - lastTs < DEDUP_WINDOW_MS) {
+        return false;  // 500ms 内同内容,视为重复冒泡
+      }
+      recentTextTs.set(text, now);
+      // 清理过期 entries(超过 MAX 时强制清)
+      if (recentTextTs.size > MAX_RECENT_ENTRIES) {
+        for (const [k, ts] of recentTextTs) {
+          if (now - ts > DEDUP_WINDOW_MS * 4) recentTextTs.delete(k);
+        }
+      }
+      return true;
+    };
 
     for await (const chunk of stream) {
       const arr = chunk as unknown as unknown[];
@@ -341,7 +364,10 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
           this.logger.log(
             `node=${nodeName} delta keys=${Object.keys(delta).join(',')}`,
           );
-          // 短路径 AIMessage forward(agent 失败 fallback 等)
+          // 只 forward 本地构造的 AIMessage(没 response_metadata,LLM 产的会有)
+          // LLM 产的最终 AIMessage 通过 'messages' mode token 流已经 forward,
+          // 这里再 forward 会跟 token 流拼出的内容不一致(token 切分有差异),
+          // 导致 dedup 失效 + 用户看到 2-3x 重复完整答案
           if (delta.messages) {
             for (const m of delta.messages) {
               const isAI =
@@ -349,30 +375,39 @@ export class SupervisorOrchestrator implements ChatOrchestratorInterface {
               if (!isAI) continue;
               const tc = (m as { tool_calls?: unknown[] }).tool_calls;
               if (Array.isArray(tc) && tc.length > 0) continue;
+              // 关键:只 forward 本地构造的 fallback 消息(LLM 产的 response_metadata 非空)
+              const isLocallyConstructed =
+                Object.keys(
+                  (m as { response_metadata?: Record<string, unknown> })
+                    .response_metadata ?? {},
+                ).length === 0;
+              if (!isLocallyConstructed) continue;
               const text = contentToString(m.content);
-              if (text) {
+              if (text && tryForwardText(text)) {
                 finalText += text;
                 yield { type: 'text', content: text };
               }
             }
           }
-          // finalAnswer 写入 → emit done
-          if (delta.finalAnswer && delta.finalAnswer.length > 0) {
-            if (!finalText.includes(delta.finalAnswer)) {
-              finalText = delta.finalAnswer;
-              yield { type: 'text', content: delta.finalAnswer };
-            }
-          }
+          // 不再 forward finalAnswer — 它的内容跟 token 流或本地 AIMessage 重叠,
+          // 重复 emit。finalAnswer 只用作 chat-history 持久化(在 processStream 末尾)
         }
       } else if (mode === 'messages') {
         const [chunkMsg, meta] = payload as [
           { content?: unknown },
-          { langgraph_node?: string },
+          { langgraph_node?: string; name?: string },
         ];
         const node = meta?.langgraph_node ?? '';
-        if (node === 'agent' || node.endsWith(':agent')) {
+        const name = meta?.name ?? '';
+        // forward 内层 agent 节点的 token(streamMode messages)
+        // 也 forward 任何 chat model 调用的 token(name 含 "ChatModel" / "LLM")
+        const isAgentNode =
+          node === 'agent' ||
+          node.endsWith(':agent') ||
+          /ChatModel|LLM/i.test(name);
+        if (isAgentNode) {
           const text = contentToString(chunkMsg.content);
-          if (text) {
+          if (text && tryForwardText(text)) {
             finalText += text;
             yield { type: 'text', content: text };
           }
