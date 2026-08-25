@@ -7,6 +7,7 @@ import {
 } from '@langchain/core/messages';
 import { ChatAnthropic } from '@langchain/anthropic';
 import type { Plan } from './supervisor-planner';
+import { cachedSystemPrompt } from './prompt-cache';
 
 const logger = new Logger('SupervisorAggregator');
 
@@ -47,7 +48,7 @@ function buildAggregatorMessages(
   >,
 ): BaseMessage[] {
   const messages: BaseMessage[] = [
-    new SystemMessage(AGGREGATOR_SYSTEM_PROMPT),
+    cachedSystemPrompt(AGGREGATOR_SYSTEM_PROMPT),
     new HumanMessage(`用户原问题:${userQuestion.slice(0, 300)}`),
   ];
 

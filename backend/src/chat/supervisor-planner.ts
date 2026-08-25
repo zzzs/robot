@@ -8,6 +8,7 @@ import {
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { Logger } from '@nestjs/common';
+import { cachedSystemPrompt } from './prompt-cache';
 
 /**
  * Plan 数据结构 — V4 supervisor 的核心契约
@@ -123,9 +124,21 @@ export function buildPlannerTool(): {
     func: (input) => Promise.resolve(JSON.stringify(input)),
   });
   // 注:返回函数避免提前绑 model(model 由 supervisor-orchestrator 注入)
+  // tool_choice 控制:默认不传(LLM 自主决定),设 TOOL_CHOICE_FORCE=any 时强制必调工具
+  // 注意:Aliyun Anthropic 兼容网关可能丢 tool_choice 参数(导致 LLM 不返 tool_call),
+  //       在网关不支持时设了反而坏,所以默认关
+  const toolChoiceOpts =
+    process.env.TOOL_CHOICE_FORCE === 'any'
+      ? ({ tool_choice: 'any' as const } as Parameters<
+          typeof ChatAnthropic.prototype.bindTools
+        >[1])
+      : undefined;
   return {
     planTool,
-    plannerModel: (model) => model.bindTools([planTool]),
+    plannerModel: (model: ChatAnthropic) =>
+      toolChoiceOpts
+        ? model.bindTools([planTool], toolChoiceOpts)
+        : model.bindTools([planTool]),
   };
 }
 
@@ -149,7 +162,7 @@ export function createPlannerNode(plannerModel: ReturnType<ChatAnthropic['bindTo
       typeof lastUser?.content === 'string' ? lastUser.content : '';
 
     const prompt = [
-      new SystemMessage(PLANNER_SYSTEM_PROMPT),
+      cachedSystemPrompt(PLANNER_SYSTEM_PROMPT),
       new HumanMessage(userText.slice(0, 500)),
     ];
 

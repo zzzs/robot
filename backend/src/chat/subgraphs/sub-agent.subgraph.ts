@@ -4,6 +4,7 @@ import { DynamicStructuredTool } from '@langchain/core/tools';
 import { Annotation, END, START, StateGraph } from '@langchain/langgraph';
 import { messagesStateReducer } from '@langchain/langgraph';
 import { ChatAnthropic } from '@langchain/anthropic';
+import { cachedSystemPrompt } from '../prompt-cache';
 
 const logger = new Logger('SubAgent');
 
@@ -51,7 +52,7 @@ export function buildSubAgent(opts: {
       (m) => !(m instanceof SystemMessage),
     );
     const response = (await boundModel.invoke([
-      new SystemMessage(systemPrompt),
+      cachedSystemPrompt(systemPrompt),
       ...messagesWithoutSystem,
     ])) as AIMessage;
     logger.log(`agent LLM response: tool_calls=${response.tool_calls?.length ?? 0}`);

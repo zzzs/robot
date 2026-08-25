@@ -433,3 +433,378 @@ for await (const chunk of agent.stream({ messages: [...] })) { ... }
 LangChain/LangGraph 的"玩法"主线:**StateGraph(图)+ Annotation(reducer)+ Send/Command(控制流)+ interrupt(HITL)+ subgraph(组合)+ streamMode(可观测)+ bindTools/structured(LLM 交互)**。
 
 把这 7 个核心 API 组合,能 cover 95% 的 LLM 应用场景。剩下 5%(极致低延迟 / 自定义事件总线 / 实时流处理)需要别的工具。
+
+---
+
+## 九、未用但高级/重要的 API
+
+按"价值 × 易实施"分级。
+
+### 🔥 P0 — 强烈推荐(省成本 + 提质)
+
+#### 1. `CacheBackedEmbeddings` — embedding 缓存 ✅ 已实施(2026-08-11)
+
+**省成本神器**:同文本(按 SHA-256 hash)直接命中内存,不调 API
+
+**实现**(本项目):
+- 文件:`backend/src/codebase/glm-embedder.ts`
+- 改造:`GLMEmbedder` 内置 `Map<hash, embedding>` cache
+- `embedDocuments()` 先批量查 cache,未命中的才调 API
+- 统计:cache 命中率(每 100 次 log 一次)
+
+**收益**:
+- 索引时同文件未变 chunk → 0 成本(只 embed 真的变了的)
+- 增量更新时省 50-90% 成本
+- 全量重建时也受益(同 chunk 跨多次重建 cache 命中)
+
+**通用实现**(LangChain 原生):
+```typescript
+import { CacheBackedEmbeddings } from '@langchain/community';
+import { InMemoryStore } from '@langchain/langgraph';
+
+const cached = new CacheBackedEmbeddings({
+  underlyingEmbeddings: new OpenAIEmbeddings({...}),
+  documentEmbeddingCache: new InMemoryStore(),
+});
+```
+
+#### 2. Prompt Caching — LLM 调用 prefix cache ❌ 实测会 crash(保持关闭)
+
+**省成本**:长 prompt(system prompt + few-shot)的同 prefix 第二次调用起,只算 10% 价格
+
+**实现**(本项目):
+- 文件:`backend/src/chat/prompt-cache.ts` — `cachedSystemPrompt(text)` helper
+- 加环境变量 `PROMPT_CACHE_ENABLED=true` 启用(默认关)
+- 启用后,长 system prompt 用 content blocks 格式 + `cache_control: { type: 'ephemeral' }`
+- 应用位置:`sub-agent.subgraph.ts`(影响所有 sub_agent)、`supervisor-planner.ts`、`supervisor-aggregator.ts`
+
+**实测结果(2026-08-24)**:**启用后 backend crash,进程消失,无 JS 异常日志**(底层 SDK/native crash)。关闭后稳定运行。原因猜测:
+- Aliyun 网关透传 `cache_control` 给 Anthropic 后端,响应里返 `cache_creation_input_tokens` / `cache_read_input_tokens` 新字段,LangChain Anthropic SDK 或 Aliyun 网关解析时 native crash
+- 或 cache_control 序列化到 Postgres checkpointer 时格式不兼容,加载时 crash
+
+**结论**:**保持 `PROMPT_CACHE_ENABLED=false`**。代码保留(将来换直连 Anthropic API 或升级 SDK 后可重试)。
+
+**通用用法**(Anthropic 原生直连时可用,绕过 Aliyun 网关):
+```typescript
+new SystemMessage({
+  content: [
+    {
+      type: 'text',
+      text: LONG_SYSTEM_PROMPT,
+      cache_control: { type: 'ephemeral' },
+    },
+  ],
+});
+```
+
+**适用 prompt 长度**:
+- Claude 3.5 Sonnet:≥ 1024 tokens 才能缓存
+- Claude 3 Opus:≥ 2048 tokens
+- GLM-5.2:可能支持(待确认网关)
+
+#### 3. Tool Choice 控制 — 强制/禁止工具调用 ✅ 已实施(2026-08-11)
+
+**强制 LLM 必调 plan/route tool**,避免返纯文本
+
+**实现**(本项目):
+- 文件:`backend/src/chat/supervisor-planner.ts`
+- 加环境变量 `TOOL_CHOICE_FORCE=any` 启用(默认关)
+- 启用后,planner 的 bindTools 加 `tool_choice: 'any'`
+
+**为什么默认关**:Aliyun 兼容网关丢了 tool_choice 参数会导致 LLM 不返 tool_call(之前踩过坑,见 `supervisor-orchestrator.ts` 注释)
+
+**通用用法**:
+```typescript
+// bindTools 时控制 tool_choice:
+const model = chatModel.bindTools(tools, {
+  tool_choice: 'any',      // 强制必须调任意工具
+  // tool_choice: 'auto',  // 自主决定(默认)
+  // tool_choice: 'none',  // 禁止调工具
+  // tool_choice: { name: 'search_codebase' },  // 强制调特定工具
+});
+```
+
+### 🥇 P1 — 推荐(提质)
+
+#### 4. Retry Policy — 节点级容错
+
+```typescript
+graph.addNode('stock_agent', stockAgentNode, {
+  retryPolicy: {
+    maxAttempts: 3,
+    exponentialBackoff: true,
+    retryOn: (err) => err.message.includes('rate_limit'),
+  },
+});
+```
+
+**适用**:GLM API 限流时自动重试,提升稳定性。改造量 5 行/节点。
+
+#### 5. MMR 检索(Max Marginal Relevance)— 结果多样性
+
+```typescript
+const docs = await vectorStore.maxMarginalRelevanceSearch(query, {
+  k: 10,
+  fetchK: 50,           // 先取 50
+  lambda: 0.5,          // 0=最大多样性, 1=最大相关性
+});
+```
+
+**适用**:search_codebase 返 top-5 可能是同文件 5 个相邻 chunk(AutoMerge 修了部分但不够),MMR 保证 5 个结果分散在不同文件。
+
+#### 6. Store API — 跨会话长期记忆
+
+```typescript
+import { InMemoryStore, getStore } from '@langchain/langgraph';
+
+const graph = new StateGraph(State)...compile({ checkpointer, store: new InMemoryStore() });
+
+// 节点内访问:
+const store = getStore();
+await store.put(['user', userId], 'preferences', { prefers: '简洁' });
+const prefs = await store.get(['user', userId], 'preferences');
+```
+
+**区别 checkpointer**:checkpointer 是单 thread(session)状态;Store 是**跨 thread 的长期记忆**(用户跨多次会话的偏好、长期事实)。
+
+**适用**:用户偏好持久化(每次会话开始加载)。
+
+### 🥈 P2 — 中等价值(API 高级,场景特定)
+
+#### 7. LCEL(LangChain Expression Language)
+
+```typescript
+import { RunnableParallel, RunnablePassthrough, RunnableLambda, RunnableBranch } from '@langchain/core/runnables';
+
+const chain = RunnablePassthrough.assign({
+  context: retriever,
+}).pipe(prompt).pipe(model).pipe(parser);
+
+const parallel = new RunnableParallel({
+  stock: stockChain,
+  news: newsChain,
+});
+
+const branch = new RunnableBranch(
+  [(input) => input.isStock, stockChain],
+  [(input) => input.isNews, newsChain],
+  defaultChain,
+);
+```
+
+**适用**:简单链式编排,跟 LangGraph StateGraph 二选一。
+
+#### 8. `task` / `entrypoint` 函数式 API(LangGraph 1.5+)
+
+```typescript
+import { task, entrypoint } from '@langchain/langgraph';
+
+const workflow = entrypoint({ name: 'workflow', checkpointer }, async (input) => {
+  const step1 = await task('step1', async (x) => x * 2)(input);
+  const step2 = await task('step2', async (x) => x + 1)(step1);
+  return step2;
+});
+```
+
+**适用**:线性流程,不需要状态机时。
+
+#### 9. `OutputFixingParser` — 结构化输出容错
+
+```typescript
+import { OutputFixingParser } from 'langchain/output_parsers';
+
+const parser = StructuredOutputParser.fromZodSchema(mySchema);
+const fixingParser = new OutputFixingParser(parser, model);
+// 解析失败时,自动让 LLM 修一下输出再重试
+```
+
+**适用**:LLM 偶尔返不合规 JSON 时。
+
+#### 10. `writer.write` + 自定义事件(深化用法)
+
+```typescript
+import { getWriter } from '@langchain/langgraph';
+
+const longTaskNode = async (state) => {
+  const writer = getWriter();
+  for (let i = 0; i < 10; i++) {
+    await processChunk(i);
+    writer.write({
+      type: 'progress',
+      step: i + 1,
+      total: 10,
+      message: `处理第 ${i+1}/10 块`,
+    });
+  }
+  return { result: 'done' };
+};
+
+// 前端 streamMode 加 'custom' 接:
+for await (const chunk of stream) {
+  if (mode === 'custom' && payload.type === 'progress') {
+    showProgress(payload);
+  }
+}
+```
+
+**适用**:sub_agent 内部多轮搜时,实时反馈"第 N 轮搜,关键词 X"给前端。
+
+#### 11. Programmatic Time Travel — 回放历史 checkpoint
+
+```typescript
+const history = [];
+for await (const state of compiled.getStateHistory({ configurable: { thread_id } })) {
+  history.push(state);
+}
+
+await compiled.stream(input, {
+  configurable: {
+    thread_id,
+    checkpoint_id: history[3].config.configurable.checkpoint_id,
+  },
+});
+```
+
+**适用**:调试、A/B 测试 plan、回滚到出错前的 state。
+
+#### 12. `getContext` / `getStore` / `getWriter` API
+
+```typescript
+import { getConfig, getStore, getWriter, getCurrentTaskInput } from '@langchain/langgraph';
+
+const node = async (state) => {
+  const config = getConfig();
+  const threadId = config.configurable.thread_id;
+  const store = getStore();
+  const writer = getWriter();
+  const input = getCurrentTaskInput();
+};
+```
+
+**适用**:节点函数需要访问 thread_id / store / writer 等 runtime info。
+
+### 🥉 P3 — 特定场景才用
+
+#### 13. 多模态 HumanMessage — 图片 + 文本
+
+```typescript
+const msg = new HumanMessage({
+  content: [
+    { type: 'text', text: '这张图里是什么?' },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,...' } },
+  ],
+});
+```
+
+**适用**:UI 截图分析、PDF 处理。
+
+#### 14. Async concurrency control
+
+```typescript
+import { pLimit } from 'p-limit';
+
+const limit = pLimit(5);  // 最多 5 个并发
+const results = await Promise.all(
+  queries.map(q => limit(() => model.invoke(q))),
+);
+```
+
+**适用**:批量 LLM 调用时防爆 rate limit。
+
+#### 15. Document Transformers
+
+```typescript
+import { Html2TextTransformer } from '@langchain/community';
+import { EmbeddingsRedundantFilter } from 'langchain/retrievers/document_compressors';
+
+const cleaned = await new Html2TextTransformer().transformDocuments(docs);
+const filter = new EmbeddingsRedundantFilter({ embeddings, similarityThreshold: 0.95 });
+```
+
+**适用**:抓网页后清理、检索结果去重。
+
+#### 16. Annotation.Tags(LangGraph 1.5+)— 字段标记
+
+```typescript
+const State = Annotation.Root({
+  public_field: Annotation<string>(),
+  internal: Annotation<string>({
+    tags: ['hd'],  // Hidden,不暴露给 LLM 上下文
+  }),
+});
+```
+
+#### 17. Channel Types(高级 reducer)
+
+```typescript
+import { LastValue, Topic, BinaryOperatorAggregate } from '@langchain/langgraph';
+
+const State = Annotation.Root({
+  single: new LastValue<string>(),
+  queue: new Topic<string>(),                    // FIFO 队列
+  counter: new BinaryOperatorAggregate<number>((a, b) => a + b),
+});
+```
+
+#### 18. Async streaming aggregation — 按段落流
+
+```typescript
+let buffer = '';
+for await (const chunk of model.stream(prompt)) {
+  buffer += chunk.content;
+  if (buffer.length > 100 || buffer.endsWith('。')) {
+    yield { type: 'text', content: buffer };
+    buffer = '';
+  }
+}
+if (buffer) yield { type: 'text', content: buffer };
+```
+
+**适用**:前端 SSE 渲染优化。
+
+---
+
+## 十、本项目实施状态(2026-08-11)
+
+### ✅ 已实施
+
+| API | 文件 | 环境变量 | 默认状态 |
+|---|---|---|---|
+| CacheBackedEmbeddings | `codebase/glm-embedder.ts` | (无,默认开) | ✅ 开 |
+| Prompt Caching | `chat/prompt-cache.ts` | `PROMPT_CACHE_ENABLED=true` | ❌ 实测 crash,保持关闭 |
+| Tool Choice 强制 | `chat/supervisor-planner.ts` | `TOOL_CHOICE_FORCE=any` | ❌ 默认关(Aliyun 网关兼容性) |
+
+### 🟡 待评估(候选 P1)
+
+- Retry Policy(节点级容错)
+- MMR 检索(结果多样性)
+- Store API(跨会话记忆)
+- `writer.write` 自定义事件(UI 进度)
+- OutputFixingParser(结构化输出容错)
+
+### 📊 实施后的成本影响(估算)
+
+| 场景 | 改造前 | 改造后(全开) | 节省 |
+|---|---|---|---|
+| 全量索引 278 chunks(首次) | 278 次 embed | 278 次(cache 空时全 miss) | 0%(首次没缓存) |
+| 增量索引 5 chunks 改动 | 5 次 embed | 5 次 + cache hit 同文件其他 chunks | 0%(本来就是 5 次) |
+| 全量索引 278 chunks(第二次) | 278 次 embed | 0 次(全 cache hit) | **100%** |
+| 单次问答(planner + sub_agent + aggregator) | 3 次 LLM + 长 prompt × 3 | 3 次 LLM + cache hit | **30-50%(LLM 成本)** |
+
+注:CacheBackedEmbeddings 对"全量重建"受益最大;Prompt Caching 对"高频问答"受益最大。
+
+---
+
+## 十一、避坑约定
+
+实施时遇到的坑(后续避):
+
+1. **Aliyun Anthropic 兼容网关**:丢了 `tool_choice` 参数,导致 LLM 不返 tool_call。所以:
+   - 用 `bindTools` 而不是 `withStructuredOutput`
+   - `TOOL_CHOICE_FORCE` 默认关,测过网关透传才开
+
+2. **同 content 不同层 emit**(subgraphs:true):同一 chunk 在 parent/subgraph/inner 多层冒泡,导致 SSE 2-3x 重复。修复:100ms 时间窗内容级 dedup。
+
+3. **LangSmith tracer 嵌套 subgraph**:`No tool run to end` 警告。非致命,等 LangGraph v1.5+ 修复。
+
+4. **CacheBackedEmbeddings 内存增长**:Map 无上限会涨。当前实现保留 200 entries,清理过期项。生产建议用 Redis / Postgres 持久化 cache。
